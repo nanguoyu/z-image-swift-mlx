@@ -25,9 +25,9 @@ public struct ZImageArchitecture: DiffusionArchitecture {
         throw ZImageError.notImplemented("encode (Qwen3-4B text encoder)")
     }
 
-    public func denoiserBlocks(source: WeightSource) throws -> [any StreamableBlock] {
-        // TODO(phase0): build the S3-DiT single-stream blocks as StreamableBlocks (load/run/release).
-        throw ZImageError.notImplemented("denoiserBlocks (S3-DiT single-stream)")
+    public func makeDenoiser(source: WeightSource) throws -> any Denoiser {
+        // TODO(phase0): build the S3-DiT denoiser (patch-embed → single-stream blocks → unembed).
+        throw ZImageError.notImplemented("makeDenoiser (S3-DiT single-stream)")
     }
 
     public func initialLatent(size: ImageSize, seed: UInt64, reference: CGImage?, strength: Float,

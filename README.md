@@ -15,4 +15,4 @@ per-architecture Swift cost).
 
 ## License
 
-Apache-2.0 (intended). Model weights are Apache-2.0 (Tongyi-MAI).
+Apache-2.0. Model weights are Apache-2.0 (Tongyi-MAI).

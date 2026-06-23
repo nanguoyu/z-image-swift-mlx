@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
-import MLX
+@preconcurrency import MLX
+import MLXRandom
 import DiffusionCore
 
 /// Z-Image (Tongyi) — single-stream S3-DiT with a Qwen3-4B text encoder.
@@ -33,13 +34,21 @@ public struct ZImageArchitecture: DiffusionArchitecture {
 
     public func initialLatent(size: ImageSize, seed: UInt64, reference: CGImage?, strength: Float,
                               source: WeightSource) throws -> MLXArray {
-        // TODO(phase0): seeded latent (+ optional img2img encode of `reference`).
-        throw ZImageError.notImplemented("initialLatent")
+        // Seeded Gaussian latent in VAE space [1, C, H/8, W/8].
+        // TODO(phase0): img2img — encode `reference` through the VAE and blend by `strength`.
+        let f = ZImageConfig.VAE.downsampleFactor
+        let c = ZImageConfig.VAE.latentChannels
+        return MLXRandom.normal([1, c, size.height / f, size.width / f], key: MLXRandom.key(seed))
     }
 
     public func decode(_ latent: MLXArray, source: WeightSource) async throws -> CGImage {
-        // TODO(phase0): VAE decode → CGImage.
-        throw ZImageError.notImplemented("decode (VAE)")
+        // TODO(phase0): load the VAE weights from `source` and cache the instance.
+        let vae = ZImageVAE()
+        let imageNHWC = vae.decode(latent)              // [B, H, W, 3] in [-1, 1]
+        guard let image = ImageConversion.cgImage(fromHWC: imageNHWC[0], range: .signed) else {
+            throw ZImageError.notImplemented("VAE decode produced no image")
+        }
+        return image
     }
 }
 

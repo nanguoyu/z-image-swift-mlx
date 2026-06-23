@@ -6,11 +6,28 @@ import UniformTypeIdentifiers
 import CoreGraphics
 
 // swift run zimage-demo <model-dir> "<prompt>" [size] [steps] [out.png]
+//   or: swift run zimage-demo probe <repoId>     (download only *.json — a cheap download audit)
 setvbuf(stdout, nil, _IONBF, 0)
-
 let args = CommandLine.arguments
+
+if args.count >= 3, args[1] == "probe" {
+    let repoId = args[2]
+    let base = URL(fileURLWithPath: NSTemporaryDirectory()).appending(component: "zimage-probe")
+    let downloader = ModelDownloader(downloadBase: base)
+    print("probing \(repoId) → \(base.path) (json only)")
+    let url = try await downloader.download(repoId: repoId, matching: ["**/*.json"]) { f in
+        print(String(format: "  %.0f%%", f * 100))
+    }
+    let files = (try? FileManager.default.subpathsOfDirectory(atPath: url.path)) ?? []
+    print("resolved dir: \(url.path)")
+    print("files: \(files.filter { $0.hasSuffix(".json") }.sorted().joined(separator: ", "))")
+    print("localURL matches resolved: \(downloader.localURL(repoId: repoId).path == url.path)")
+    exit(0)
+}
+
 guard args.count >= 3 else {
     print("usage: zimage-demo <model-dir> \"<prompt>\" [size=1024] [steps=8] [out=zimage.png]")
+    print("   or: zimage-demo probe <repoId>")
     exit(2)
 }
 let modelDir = URL(fileURLWithPath: args[1])

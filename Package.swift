@@ -29,6 +29,7 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Hub", package: "swift-transformers"),
             ]
         ),
         // Tiny CLI: `swift run zimage-demo <model-dir> "<prompt>" [size] [steps] [out.png]`.

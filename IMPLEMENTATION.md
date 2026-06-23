@@ -4,13 +4,14 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 [`Tongyi-MAI/Z-Image`](https://github.com/Tongyi-MAI/Z-Image) modeling code, the HF model configs
 (`Tongyi-MAI/Z-Image-Turbo`, community MLX repo `deepsweet/Z-Image-Turbo-6B-MLX-Q4`).
 
-> **Status (compile-verified; numerics unvalidated):** `ZImageConfig`, the S3-DiT blocks
-> (`ZImageFeedForward`/`ZImageAttention`/`ZImageTransformerBlock`), the **Qwen3-4B encoder**
-> (`Qwen3TextEncoder`), and the **denoiser assembly** (`ZImageDenoiser` conforming to `Denoiser`:
-> patchify → single-stream → AdaLN blocks → unembed; `makeDenoiser` returns it) all compile
-> against MLXNN. **Remaining:** VAE decode/encode; 4-bit weight loading into the module tree (key
-> map below); tokenizer wiring (`Qwen2Tokenizer` + chat template); the real 3D-axes RoPE
-> (currently a 1D placeholder); and **GPU numeric parity vs the Python reference** — nothing has run.
+> **Status (compile-verified; numerics unvalidated):** the full `ZImageArchitecture` is wired and
+> compiles — all four `DiffusionArchitecture` seam methods: `encode` (Qwen3-4B encoder +
+> `Tokenizers` chat template), `makeDenoiser` (the S3-DiT `ZImageDenoiser`), `initialLatent`
+> (seeded Gaussian noise), and `decode` (the `ZImageVAE` AutoencoderKL decoder). **Remaining (all
+> need a GPU):** 4-bit weight loading into the three module trees (encoder / DiT / VAE — key map
+> below; conv OIHW→OHWI transpose; `to_out.0` remap; resolve the tokenizer + weights from the
+> downloaded model folder rather than the hub id); the real 3D-axes RoPE (1D placeholder now);
+> img2img encode; and **numeric parity vs the Python reference**. Nothing has run.
 
 ## Components & sizes
 

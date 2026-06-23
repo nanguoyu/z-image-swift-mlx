@@ -2,6 +2,7 @@ import Foundation
 import CoreGraphics
 @preconcurrency import MLX
 import MLXRandom
+import Tokenizers
 import DiffusionCore
 
 /// Z-Image (Tongyi) — single-stream S3-DiT with a Qwen3-4B text encoder.
@@ -22,8 +23,16 @@ public struct ZImageArchitecture: DiffusionArchitecture {
         defaultGuidance: 1.0)
 
     public func encode(_ prompt: String, negative: String?, source: WeightSource) async throws -> Conditioning {
-        // TODO(phase0): Qwen3-4B encode → embeddings. Loaded here, released by the engine after.
-        throw ZImageError.notImplemented("encode (Qwen3-4B text encoder)")
+        // TODO(phase0): resolve the tokenizer + load Qwen3-4B weights from `source`'s on-disk
+        // text_encoder/ folder instead of the hub id; pass `enable_thinking` via the template;
+        // take the second-to-last hidden state (already done in the encoder).
+        let tokenizer = try await AutoTokenizer.from(pretrained: "Qwen/Qwen3-4B")
+        let messages: [Message] = [["role": "user", "content": prompt]]
+        let ids = try tokenizer.applyChatTemplate(messages: messages)
+        let trimmed = Array(ids.prefix(ZImageConfig.TextEncoder.maxSequenceLength))
+        let tokens = MLXArray(trimmed.map { Int32($0) }).reshaped([1, trimmed.count])
+        let hidden = Qwen3TextEncoder().hiddenStates(tokens)   // [1, N, 2560]
+        return Conditioning(embeddings: hidden)
     }
 
     public func makeDenoiser(source: WeightSource) throws -> any Denoiser {

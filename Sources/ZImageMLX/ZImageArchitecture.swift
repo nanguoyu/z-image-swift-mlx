@@ -26,8 +26,9 @@ public struct ZImageArchitecture: DiffusionArchitecture {
     }
 
     public func makeDenoiser(source: WeightSource) throws -> any Denoiser {
-        // TODO(phase0): build the S3-DiT denoiser (patch-embed → single-stream blocks → unembed).
-        throw ZImageError.notImplemented("makeDenoiser (S3-DiT single-stream)")
+        // Builds the S3-DiT denoiser structure. TODO(phase0): load the 4-bit weights from
+        // `source` into the module tree (key map in IMPLEMENTATION.md) before running.
+        ZImageDenoiser()
     }
 
     public func initialLatent(size: ImageSize, seed: UInt64, reference: CGImage?, strength: Float,

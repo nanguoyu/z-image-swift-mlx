@@ -91,10 +91,11 @@ final class ZImageTransformerBlock: Module {
     /// `timeEmb` is the timestep embedding `[B, dim]`; ignored by context_refiner blocks. `cos`/`sin`
     /// are the 3D-RoPE tables for the tokens being processed. NOTE: exact AdaLN numerics need parity.
     func callAsFunction(_ x: MLXArray, timeEmb: MLXArray?, cos: MLXArray, sin: MLXArray) -> MLXArray {
-        if let ada = adaLNModulation.first, let t = timeEmb {
+        if let ada = adaLNModulation.first, let timeEmb {
             // Block adaLN: a single Linear (NO leading SiLU) → [scale_msa, gate_msa, scale_mlp,
             // gate_mlp]; scales used as (1 + scale), gates are tanh'd. (The final layer differs:
-            // it DOES have a leading SiLU and is scale-only.)
+            // it DOES have a leading SiLU and is scale-only.) Match the hidden dtype (bf16).
+            let t = timeEmb.asType(x.dtype)
             let parts = split(ada(t), parts: 4, axis: -1)
             let scaleAttn = expandedDimensions(parts[0], axis: 1)
             let gateAttn = expandedDimensions(tanh(parts[1]), axis: 1)

@@ -68,7 +68,7 @@ public final class ZImagePipeline: @unchecked Sendable {
         let sampler = FlowMatchEulerSampler(shift: ZImageConfig.Scheduler.shift)
         let sigmas = sampler.timesteps(steps: steps)
         let channels = ZImageConfig.VAE.latentChannels
-        var latent = MLXRandom.normal([1, channels, size / 8, size / 8], key: MLXRandom.key(seed))
+        var latent = MLXRandom.normal([1, channels, size / 8, size / 8], key: MLXRandom.key(seed)).asType(.bfloat16)
         for i in 0..<steps {
             let t = sigmas[i], tNext = sigmas[i + 1]
             let timestep = MLXArray(t)
@@ -78,7 +78,7 @@ public final class ZImagePipeline: @unchecked Sendable {
             eval(latent)
             progress?(i + 1, steps)
         }
-        let imageNHWC = vae.decode(latent)
+        let imageNHWC = vae.decode(latent).asType(.float32)
         eval(imageNHWC)
         guard let image = ImageConversion.cgImage(fromHWC: imageNHWC[0], range: .signed) else {
             throw PipelineError.decodeFailed

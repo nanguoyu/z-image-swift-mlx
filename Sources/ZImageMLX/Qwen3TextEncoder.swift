@@ -89,37 +89,28 @@ final class Qwen3Layer: Module {
     }
 }
 
-/// The `model.*` submodule (so weight keys resolve to `model.embed_tokens`, `model.layers.N.*`).
-final class Qwen3Model: Module {
+/// Z-Image's caption encoder. Runs the prompt through Qwen3-4B and returns the second-to-last
+/// hidden state `[B, N, 2560]`. The converted checkpoint strips the HF `model.` prefix, so the
+/// embeddings/layers/norm live at the top level here.
+public final class Qwen3TextEncoder: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     let layers: [Qwen3Layer]
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
-    override init() {
+    public override init() {
         let c = ZImageConfig.TextEncoder.self
         self._embedTokens.wrappedValue = Embedding(embeddingCount: 151_936, dimensions: c.hidden)
         self.layers = (0..<c.layers).map { _ in Qwen3Layer() }
         self._norm.wrappedValue = RMSNorm(dimensions: c.hidden, eps: c.rmsEps)
         super.init()
     }
-}
-
-/// Z-Image's caption encoder. Runs the prompt through Qwen3-4B and returns the second-to-last
-/// hidden state `[B, N, 2560]` (the value Z-Image conditions on).
-public final class Qwen3TextEncoder: Module {
-    @ModuleInfo(key: "model") var model: Qwen3Model
-
-    public override init() {
-        self._model.wrappedValue = Qwen3Model()
-        super.init()
-    }
 
     /// `tokens` is `[B, N]` Int32 token ids. Returns the layer[-2] hidden state.
     public func hiddenStates(_ tokens: MLXArray) -> MLXArray {
-        var h = model.embedTokens(tokens)
+        var h = embedTokens(tokens)
         let mask = MultiHeadAttention.createAdditiveCausalMask(tokens.dim(1)).asType(h.dtype)
-        let target = model.layers.count - 2   // output of the second-to-last layer == hidden[-2]
-        for (i, layer) in model.layers.enumerated() {
+        let target = layers.count - 2   // output of the second-to-last layer == hidden[-2]
+        for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask)
             if i == target { return h }
         }

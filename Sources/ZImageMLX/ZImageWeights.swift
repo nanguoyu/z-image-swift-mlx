@@ -34,12 +34,18 @@ public enum ZImageWeights {
     }
 
     /// Quantize the module's Linear layers that are stored 4-bit (those with a sibling `.scales`),
-    /// then load all weights. Keys in `weights` must match the module's parameter paths.
+    /// then load all weights. Conv weights are transposed OIHW→OHWI; tensors with no matching
+    /// module parameter (recomputable buffers like `rotary_emb.inv_freq`, converter-only extras)
+    /// are dropped so the load is exact.
     public static func load(_ weights: [String: MLXArray], into module: Module,
                             groupSize: Int = 64, bits: Int = 4) {
+        // Quantize first so the QuantizedLinear `.scales`/`.biases` params exist as destinations.
         quantize(model: module, groupSize: groupSize, bits: bits) { path, layer in
             layer is Linear && weights["\(path).scales"] != nil
         }
-        module.update(parameters: ModuleParameters.unflattened(weights))
+        let prepared = weights.mapValues { conv2dWeight($0) }   // OIHW->OHWI for 4D conv weights
+        let valid = Set(module.parameters().flattened().map { $0.0 })
+        let filtered = prepared.filter { valid.contains($0.key) }
+        module.update(parameters: ModuleParameters.unflattened(filtered))
     }
 }

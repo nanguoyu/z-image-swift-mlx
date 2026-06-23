@@ -4,14 +4,24 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 [`Tongyi-MAI/Z-Image`](https://github.com/Tongyi-MAI/Z-Image) modeling code, the HF model configs
 (`Tongyi-MAI/Z-Image-Turbo`, community MLX repo `deepsweet/Z-Image-Turbo-6B-MLX-Q4`).
 
-> **Status (compile-verified; numerics unvalidated):** the full `ZImageArchitecture` is wired and
-> compiles — all four `DiffusionArchitecture` seam methods: `encode` (Qwen3-4B encoder +
-> `Tokenizers` chat template), `makeDenoiser` (the S3-DiT `ZImageDenoiser`), `initialLatent`
-> (seeded Gaussian noise), and `decode` (the `ZImageVAE` AutoencoderKL decoder). **Remaining (all
-> need a GPU):** 4-bit weight loading into the three module trees (encoder / DiT / VAE — key map
-> below; conv OIHW→OHWI transpose; `to_out.0` remap; resolve the tokenizer + weights from the
-> downloaded model folder rather than the hub id); the real 3D-axes RoPE (1D placeholder now);
-> img2img encode; and **numeric parity vs the Python reference**. Nothing has run.
+> **Status (key-aligned & compile-verified; numerics unvalidated):** the full `ZImageArchitecture`
+> is wired and compiles — all four `DiffusionArchitecture` seam methods: `encode` (Qwen3-4B encoder
+> + `Tokenizers` chat template), `makeDenoiser` (the S3-DiT `ZImageDenoiser`), `initialLatent`
+> (seeded Gaussian noise), and `decode`/`encode` (the `ZImageVAE` AutoencoderKL).
+>
+> **Module keys verified against the reference checkpoint** (`deepsweet/Z-Image-Turbo-6B-MLX-Q4`)
+> via an offline key-diff harness that flattens each MLX module tree and diffs the layer-paths
+> against the checkpoint `index.json` (no weights downloaded): **transformer 483/483, VAE 122/122,
+> text-encoder 398/399** — the single miss is `rotary_emb.inv_freq`, a recomputable RoPE buffer with
+> no learnable params (MLX regenerates it; the loader drops it). The loader (`ZImageWeights.load`)
+> quantizes the 4-bit Linears, transposes conv weights OIHW→OHWI, and filters to module
+> destinations, so the three trees load exactly.
+>
+> **Remaining (all need a GPU / the ~8 GB download):** the real 3D-axes RoPE (1D placeholder now);
+> resolving the tokenizer + weights from the downloaded model folder rather than the hub id; and
+> **numeric parity vs the Python reference** (the key-diff gate checks structure, not values —
+> shapes, the parameter-free final norm, AdaLN math, and the refiner flow are still unvalidated).
+> Nothing has run end-to-end.
 
 ## Components & sizes
 
@@ -23,9 +33,10 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 - RoPE: theta 256, 3D axes `dims=[32,48,48]`, `lens=[1536,512,512]`.
 - AdaLN: `adaLN_modulation.0` Linear `dim → 4*dim` from `silu(t_emb)` → (scale/gate)×(attn/ffn).
   context_refiner has **no** AdaLN.
-- `t_embedder` (sinusoidal 256 → mlp → dim), `cap_embedder` (RMSNorm + Linear 2560 → dim),
-  `all_x_embedder` (patch embed), `all_final_layer` (norm + Linear + AdaLN → unpatchify),
-  `x_pad_token` / `cap_pad_token` parameters.
+- `t_embedder` (sinusoidal 256 → `linear1` → silu → `linear2` → dim), `cap_embedder` (RMSNorm +
+  Linear 2560 → dim), `all_x_embedder.2-1` (patch-embed Linear), `all_final_layer.2-1`
+  (parameter-free norm + `linear` + `adaLN_modulation.0` → unpatchify), `x_pad_token` /
+  `cap_pad_token` parameters.
 
 ### Text encoder — Qwen3-4B (must be reimplemented in MLX; swift-transformers is CoreML-only and
 can't expose hidden states — use it only for the `Qwen2Tokenizer` + chat template)
@@ -41,23 +52,33 @@ can't expose hidden states — use it only for the `Qwen2Tokenizer` + chat templ
 - Flow-match Euler, **shift 3.0**, default **8 steps** (Turbo). Already implemented as
   `FlowMatchEulerSampler(shift: 3.0)` in swift-diffusion-core.
 
-## Weight keys (PyTorch state_dict; safetensors keys match exactly)
-Transformer: `layers.{0-29}.attention.{to_q,to_k,to_v,to_out.0,norm_q,norm_k}`,
+## Weight keys (verified against the checkpoint via the key-diff harness)
+Transformer (483): `layers.{0-29}.attention.{to_q,to_k,to_v,to_out.0,norm_q,norm_k}`,
 `layers.{N}.feed_forward.{w1,w2,w3}`, `layers.{N}.{attention_norm1,attention_norm2,ffn_norm1,ffn_norm2}`,
-`layers.{N}.adaLN_modulation.0`, `noise_refiner.{0-1}.*`, `context_refiner.{0-1}.*`,
-`t_embedder.mlp.{0,1}`, `cap_embedder.{0,1}`, `all_x_embedder.2-1.*`, `all_final_layer.2-1.*`,
-`x_pad_token`, `cap_pad_token`. (Note `to_out.0` → the weight loader maps to the single Linear.)
-Qwen3: `model.embed_tokens`, `model.layers.{0-35}.self_attn.{q,k,v,o}_proj` + `{q,k}_norm`,
-`model.layers.{N}.mlp.{gate,up,down}_proj`, `{input,post_attention}_layernorm`, `model.norm`.
-VAE: `encoder.*`, `decoder.*`, `quant_conv`, `post_quant_conv` (standard diffusers AutoencoderKL).
+`layers.{N}.adaLN_modulation.0`, `noise_refiner.{0-1}.*` (with AdaLN), `context_refiner.{0-1}.*` (no
+AdaLN), `t_embedder.{linear1,linear2}`, `cap_embedder.{0,1}`, `all_x_embedder.2-1`,
+`all_final_layer.2-1.{linear,adaLN_modulation.0}` (norm is parameter-free — no `norm_final` key),
+`x_pad_token`, `cap_pad_token`. (`to_out.0`/`adaLN_modulation.0` are 1-element `[Linear]` lists.)
+Qwen3 (398 + recomputable `rotary_emb.inv_freq`): the converted checkpoint **strips the HF `model.`
+prefix** → `embed_tokens`, `layers.{0-35}.self_attn.{q,k,v,o}_proj` + `{q,k}_norm`,
+`layers.{N}.mlp.{gate,up,down}_proj`, `{input,post_attention}_layernorm`, `norm`.
+VAE (122): `encoder.*` + `decoder.*` only — **no `quant_conv`/`post_quant_conv`** in this checkpoint.
+The converter wraps top convs/norm asymmetrically: decoder `conv_in.conv`/`conv_out.conv`, encoder
+`conv_in.conv2d`/`conv_out.conv2d`, both `conv_norm_out.norm`; resnet convs/norms are direct
+(`conv1`,`conv2`,`norm1`,`norm2`,`conv_shortcut`); mid block `resnets.{0,1}` + `attentions.0`
+(`to_out.0`); up/down samplers `.conv`.
 
 ## Remaining work (in order)
-1. **Qwen3-4B encoder** in MLX (36-layer GQA transformer, 4-bit `QuantizedLinear`), returning the
-   layer[-2] hidden states. Tokenizer via swift-transformers `Qwen2Tokenizer` + the chat template.
-2. **Denoiser assembly**: patch-embed latents, build the single-stream sequence (caption tokens +
-   image tokens), 3D RoPE, run the 30+4 blocks with AdaLN from the timestep embedding, then
-   `all_final_layer` + unpatchify in `unembed`. Conform to `Denoiser` (embed/blocks/unembed).
-3. **VAE** decode (and encode for img2img) → wire `decode`/`initialLatent`.
-4. **Weight loading**: map the safetensors keys above into the MLXNN module tree (handle the
-   `to_out.0` and the quantized layout); a `RangedFileWeightSource` for streaming on iPhone.
-5. **Numerical parity**: validate each stage against the Python reference on a GPU machine.
+1. ✅ **Qwen3-4B encoder** in MLX (36-layer GQA, returns layer[-2] hidden states; keys aligned).
+   Tokenizer via swift-transformers `Tokenizers` + the chat template.
+2. ✅ **Denoiser assembly**: patch-embed, single-stream sequence (caption ‖ image), 30 main blocks
+   as streamable blocks + noise/context refiners in `embed`, `all_final_layer` + unpatchify in
+   `unembed`. Conforms to `Denoiser`. *(3D RoPE is still a 1D placeholder.)*
+3. ✅ **VAE** full AutoencoderKL (encoder + decoder) → `decode`/`encode` wired.
+4. ✅ **Weight loading**: `ZImageWeights.load` quantizes the 4-bit Linears, transposes conv weights,
+   filters to module destinations, and updates the tree. Keys verified (see status). *(Still TODO:
+   `RangedFileWeightSource` for iPhone streaming; resolve tokenizer/weights from the model folder.)*
+5. **3D-axes RoPE** (theta 256, dims `[32,48,48]`) — replace the 1D placeholder.
+6. **Numerical parity**: download the ~8 GB checkpoint and validate each stage (shapes, the
+   parameter-free final norm, AdaLN, the refiner flow, the VAE scale factor) against the Python
+   reference on a GPU. **The key-diff gate proves structure, not values — nothing has run.**

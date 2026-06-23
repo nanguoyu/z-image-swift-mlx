@@ -18,16 +18,19 @@ public actor ZImageFacadeEngine: DiffusionEngine {
 
     public static func capabilities(for model: DiffusionModel, variant: ModelVariant,
                                     on device: DeviceTier) -> EngineCapabilities {
-        // Resident facade: runnable when the weights fit the device's working-set budget.
-        let fits = variant.approximateBytes < device.memoryBudgetBytes
+        // Resident facade: estimate runtime peak above on-disk size (weights + working buffers)
+        // and gate against the device's memory budget on BOTH Mac and phone.
+        let estimatedPeak = variant.approximateBytes + variant.approximateBytes / 3
+        let fits = estimatedPeak < device.memoryBudgetBytes
         if device.isPhone {
             return EngineCapabilities(
                 runnable: fits, residency: fits ? .resident : .unsupported,
-                estimatedPeakBytes: variant.approximateBytes,
+                estimatedPeakBytes: estimatedPeak,
                 note: fits ? "Resident on a large-RAM iPhone" : "Use the streaming engine")
         }
-        return EngineCapabilities(runnable: true, residency: .resident,
-                                  estimatedPeakBytes: variant.approximateBytes, note: "Runs on Mac")
+        return EngineCapabilities(runnable: fits, residency: fits ? .resident : .unsupported,
+                                  estimatedPeakBytes: estimatedPeak,
+                                  note: fits ? "Runs on Mac" : "Insufficient memory")
     }
 
     public func load(_ model: DiffusionModel, variant: ModelVariant, source: WeightSource,
@@ -40,9 +43,11 @@ public actor ZImageFacadeEngine: DiffusionEngine {
     public func generate(_ request: GenerationRequest,
                          progress: @Sendable @escaping (GenerationProgress) -> Void) async throws -> CGImage {
         guard let pipeline else { throw ZImageEngineError.notLoaded }
+        // Surface the current limitations explicitly rather than silently dropping the request:
+        // ZImagePipeline is text-to-image and square-only for now.
+        if request.referenceImage != nil { throw ZImageEngineError.imageToImageUnsupported }
+        guard request.size.width == request.size.height else { throw ZImageEngineError.nonSquareUnsupported }
         progress(.preparing)
-        // NOTE: img2img (request.referenceImage) is not yet supported by the facade — text-to-image
-        // only for now. Square `size.width` is used (the catalog ships square sizes).
         let image = try pipeline.generate(
             prompt: request.prompt, size: request.size.width, steps: request.steps, seed: request.seed
         ) { step, total in
@@ -60,7 +65,13 @@ public actor ZImageFacadeEngine: DiffusionEngine {
 
 public enum ZImageEngineError: Error, CustomStringConvertible {
     case notLoaded
+    case imageToImageUnsupported
+    case nonSquareUnsupported
     public var description: String {
-        switch self { case .notLoaded: return "ZImageFacadeEngine: call load(...) before generate(...)" }
+        switch self {
+        case .notLoaded: return "ZImageFacadeEngine: call load(...) before generate(...)"
+        case .imageToImageUnsupported: return "ZImageFacadeEngine: image-to-image is not supported yet (text-to-image only)"
+        case .nonSquareUnsupported: return "ZImageFacadeEngine: non-square sizes are not supported yet"
+        }
     }
 }

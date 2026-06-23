@@ -33,13 +33,30 @@ public struct ModelDownloader: Sendable {
         downloadBase.appending(component: "models").appending(component: repoId)
     }
 
-    /// Cheap "already downloaded?" check: all three component indices are present on disk.
+    /// "Already fully downloaded?" — every component's index is present AND every shard it
+    /// references exists, with no in-progress `*.incomplete` markers. (Just checking the small
+    /// index files gives a false positive when a download was interrupted mid-shard.)
     public func isDownloaded(repoId: String) -> Bool {
+        let fm = FileManager.default
         let root = localURL(repoId: repoId)
-        return ["transformer", "text_encoder", "vae"].allSatisfy {
-            FileManager.default.fileExists(
-                atPath: root.appending(component: $0).appending(component: "model.safetensors.index.json").path)
+        guard fm.fileExists(atPath: root.path) else { return false }
+        // Any in-progress download marker under the repo means it's incomplete.
+        if let walker = fm.enumerator(at: root, includingPropertiesForKeys: nil) {
+            for case let url as URL in walker where url.pathExtension == "incomplete" { return false }
         }
+        for component in ["transformer", "text_encoder", "vae"] {
+            let dir = root.appending(component: component)
+            let index = dir.appending(component: "model.safetensors.index.json")
+            guard let data = try? Data(contentsOf: index),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let weightMap = json["weight_map"] as? [String: String] else { return false }
+            let shards = Set(weightMap.values)
+            guard !shards.isEmpty else { return false }
+            for shard in shards where !fm.fileExists(atPath: dir.appending(component: shard).path) {
+                return false
+            }
+        }
+        return true
     }
 
     /// Download (idempotent) and return the local model directory. `progress` reports 0…1.

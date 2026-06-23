@@ -18,10 +18,12 @@ public final class ZImagePipeline: @unchecked Sendable {
     public enum PipelineError: Error, CustomStringConvertible {
         case notLoaded
         case decodeFailed
+        case invalidSize(Int)
         public var description: String {
             switch self {
             case .notLoaded: return "ZImagePipeline: call loadModels() before generate()"
             case .decodeFailed: return "ZImagePipeline: VAE decode produced no image"
+            case .invalidSize(let s): return "ZImagePipeline: size \(s) must be a multiple of 16"
             }
         }
     }
@@ -64,11 +66,15 @@ public final class ZImagePipeline: @unchecked Sendable {
     public func generate(prompt: String, size: Int = 1024, steps: Int = ZImageConfig.Scheduler.defaultSteps,
                          seed: UInt64 = 0, progress: (@Sendable (Int, Int) -> Void)? = nil) throws -> CGImage {
         guard let denoiser, let vae else { throw PipelineError.notLoaded }
+        // VAE downsamples by 8 and the DiT patchifies by 2, so the latent side must be even:
+        // require size to be a multiple of 16 (fail at the call site, not deep in the transformer).
+        let factor = ZImageConfig.VAE.downsampleFactor
+        guard size % (factor * ZImageConfig.DiT.patchSize) == 0 else { throw PipelineError.invalidSize(size) }
         let conditioning = try encode(prompt)
         let sampler = FlowMatchEulerSampler(shift: ZImageConfig.Scheduler.shift)
         let sigmas = sampler.timesteps(steps: steps)
         let channels = ZImageConfig.VAE.latentChannels
-        var latent = MLXRandom.normal([1, channels, size / 8, size / 8], key: MLXRandom.key(seed)).asType(.bfloat16)
+        var latent = MLXRandom.normal([1, channels, size / factor, size / factor], key: MLXRandom.key(seed)).asType(.bfloat16)
         for i in 0..<steps {
             let t = sigmas[i], tNext = sigmas[i + 1]
             let timestep = MLXArray(t)

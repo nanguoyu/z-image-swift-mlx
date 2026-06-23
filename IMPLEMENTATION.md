@@ -4,10 +4,12 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 [`Tongyi-MAI/Z-Image`](https://github.com/Tongyi-MAI/Z-Image) modeling code, the HF model configs
 (`Tongyi-MAI/Z-Image-Turbo`, community MLX repo `deepsweet/Z-Image-Turbo-6B-MLX-Q4`).
 
-> **Status (key-aligned & compile-verified; numerics unvalidated):** the full `ZImageArchitecture`
-> is wired and compiles — all four `DiffusionArchitecture` seam methods: `encode` (Qwen3-4B encoder
-> + `Tokenizers` chat template), `makeDenoiser` (the S3-DiT `ZImageDenoiser`), `initialLatent`
-> (seeded Gaussian noise), and `decode`/`encode` (the `ZImageVAE` AutoencoderKL).
+> **Status (RUNNING — generates coherent images):** the full pipeline runs end-to-end in pure
+> Swift+MLX on the real 4-bit weights (`deepsweet/Z-Image-Turbo-6B-MLX-Q4`) and produces correct,
+> prompt-faithful images (validated: a clean red-panda render, 256×256, 8 steps, ~1.3 s/step on a
+> Mac). All four `DiffusionArchitecture` seam methods are implemented: `encode` (Qwen3-4B + the local
+> `Tokenizers` chat template), `makeDenoiser` (S3-DiT `ZImageDenoiser` with real 3D-axes RoPE),
+> `initialLatent`, and `decode`/`encode` (`ZImageVAE` AutoencoderKL).
 >
 > **Module keys verified against the reference checkpoint** (`deepsweet/Z-Image-Turbo-6B-MLX-Q4`)
 > via an offline key-diff harness that flattens each MLX module tree and diffs the layer-paths
@@ -29,11 +31,15 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 > timestep is scaled by **t_scale=1000** before embedding; the VAE downsample uses diffusers'
 > asymmetric `(0,1,0,1)` pad. n_heads=n_kv_heads=30 (DiT is full MHA, not GQA).
 >
-> **Remaining (all need a GPU / the ~8 GB download):** the real 3D-axes RoPE (1D placeholder now);
-> resolving the tokenizer + weights from the downloaded model folder rather than the hub id; and
-> **numeric parity vs the Python reference** (the key-diff gate checks structure, not values —
-> shapes, the parameter-free final norm, AdaLN math, and the refiner flow are still unvalidated).
-> Nothing has run end-to-end.
+> **Denoise conventions (the two bugs that mattered):** Z-Image conditions on `(1 − σ)`, not `σ`
+> (the model timestep is `(1 − σ)·1000`), and the raw flow field must be **negated** before the
+> Euler step (`x + (σ_next − σ)·(−v)`). Both are absorbed inside the denoiser, so the generic engine
+> stays convention-agnostic. The scheduler is `FlowMatchEulerDiscreteScheduler`, **static shift 3.0**.
+>
+> **Remaining (polish, not blockers):** wire weight-loading + the local tokenizer into
+> `ZImageArchitecture` (the run harness loads directly today); a `RangedFileWeightSource` for iPhone
+> streaming; close residual quality gaps vs the Python reference (sinusoidal cos/sin order, faint
+> background banding); broader resolution/seed testing.
 
 ## Components & sizes
 
@@ -85,14 +91,18 @@ The converter wraps top convs/norm asymmetrically: decoder `conv_in.conv`/`conv_
 ## Remaining work (in order)
 1. ✅ **Qwen3-4B encoder** in MLX (36-layer GQA, returns layer[-2] hidden states; keys aligned).
    Tokenizer via swift-transformers `Tokenizers` + the chat template.
-2. ✅ **Denoiser assembly**: patch-embed, single-stream sequence (caption ‖ image), 30 main blocks
+2. ✅ **Denoiser assembly**: patch-embed, single-stream sequence (image ‖ caption), 30 main blocks
    as streamable blocks + noise/context refiners in `embed`, `all_final_layer` + unpatchify in
-   `unembed`. Conforms to `Denoiser`. *(3D RoPE is still a 1D placeholder.)*
+   `unembed`. Conforms to `Denoiser`.
 3. ✅ **VAE** full AutoencoderKL (encoder + decoder) → `decode`/`encode` wired.
-4. ✅ **Weight loading**: `ZImageWeights.load` quantizes the 4-bit Linears, transposes conv weights,
-   filters to module destinations, and updates the tree. Keys verified (see status). *(Still TODO:
-   `RangedFileWeightSource` for iPhone streaming; resolve tokenizer/weights from the model folder.)*
-5. **3D-axes RoPE** (theta 256, dims `[32,48,48]`) — replace the 1D placeholder.
-6. **Numerical parity**: download the ~8 GB checkpoint and validate each stage (shapes, the
-   parameter-free final norm, AdaLN, the refiner flow, the VAE scale factor) against the Python
-   reference on a GPU. **The key-diff gate proves structure, not values — nothing has run.**
+4. ✅ **Weight loading**: `ZImageWeights.load` quantizes the 4-bit Linears + Embedding, canonicalizes
+   the `cap_embedder` keys, filters to module destinations, and updates the tree. Loads the real
+   checkpoint with zero shape mismatch.
+5. ✅ **3D-axes RoPE** (theta 256, dims `[32,48,48]`, interleaved) — per-segment in the refiners,
+   unified for the main layers.
+6. ✅ **End-to-end run + numeric parity**: runs on the real Q4 weights and generates coherent,
+   prompt-faithful images. The two denoise-convention bugs (timestep `1−σ`, velocity negation) are
+   fixed; AdaLN gates are `tanh`'d.
+7. **Polish / integration (open):** wire weight-loading + the local tokenizer into
+   `ZImageArchitecture`; `RangedFileWeightSource` for iPhone block-streaming; close residual quality
+   gaps (sinusoidal cos/sin order; faint background banding); broader resolution/seed coverage.

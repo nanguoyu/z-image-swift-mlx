@@ -125,15 +125,21 @@ final class VAEUpsample: Module {
     }
 }
 
-/// Strided-conv 2× downsample (NHWC). Key: `conv`.
+/// Strided-conv 2× downsample (NHWC). Key: `conv`. Matches diffusers Downsample2D: pad bottom/right
+/// `(0,1,0,1)` then a stride-2 VALID (padding-0) conv.
 final class VAEDownsample: Module {
     @ModuleInfo(key: "conv") var conv: Conv2d
     init(_ channels: Int) {
-        // diffusers pads (0,1,0,1) then stride-2 valid conv; here a stride-2 padded conv approximates it.
-        self._conv.wrappedValue = conv3(channels, channels, stride: 2)
+        self._conv.wrappedValue = Conv2d(inputChannels: channels, outputChannels: channels,
+            kernelSize: 3, stride: IntOrPair((2, 2)), padding: 0)
         super.init()
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { conv(x) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // NHWC: pad H and W on the high side only (bottom, right).
+        let p = MLX.padded(x, widths: [IntOrPair((0, 0)), IntOrPair((0, 1)),
+                                       IntOrPair((0, 1)), IntOrPair((0, 0))])
+        return conv(p)
+    }
 }
 
 /// Decoder up-stage: `count` resnets (first changes channels) + optional upsample.
@@ -248,17 +254,19 @@ public final class ZImageVAE: Module {
     }
 
     public func decode(_ latentNCHW: MLXArray) -> MLXArray {
-        let scaled = latentNCHW / ZImageConfig.VAE.scaleFactor
+        // FLUX-family inverse normalization: latent / scale + shift.
+        let scaled = latentNCHW / ZImageConfig.VAE.scaleFactor + ZImageConfig.VAE.shiftFactor
         let nhwc = scaled.transposed(0, 2, 3, 1)        // NCHW -> NHWC
         return decoder(nhwc)                            // [B, H, W, 3]
     }
 
-    /// Encode to the distribution mean (deterministic), scaled to latent space. NCHW in/out.
+    /// Encode to the distribution mean (deterministic), normalized to latent space. NCHW in/out.
     public func encode(_ imageNCHW: MLXArray) -> MLXArray {
         let nhwc = imageNCHW.transposed(0, 2, 3, 1)     // NCHW -> NHWC
-        let moments = encoder(nhwc)                     // [B, h, w, 8]
+        let moments = encoder(nhwc)                     // [B, h, w, 2*latent]
         let c = ZImageConfig.VAE.latentChannels
-        let mean = moments[.ellipsis, 0 ..< c]          // mean half
-        return mean.transposed(0, 3, 1, 2) * ZImageConfig.VAE.scaleFactor   // NHWC -> NCHW
+        let mean = moments[.ellipsis, 0 ..< c]          // mean half (channel-last)
+        // FLUX-family normalization: (mean - shift) * scale.
+        return (mean.transposed(0, 3, 1, 2) - ZImageConfig.VAE.shiftFactor) * ZImageConfig.VAE.scaleFactor
     }
 }

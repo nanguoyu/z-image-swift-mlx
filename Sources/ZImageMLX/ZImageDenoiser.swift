@@ -26,7 +26,8 @@ final class TimestepEmbedder: Module {
         super.init()
     }
     func callAsFunction(_ t: MLXArray) -> MLXArray {
-        linear2(silu(linear1(TimestepEmbedder.sinusoidal(t, dim: freqDim))))
+        // Flow-match timestep t∈[0,1] is scaled by t_scale (1000) before the sinusoidal embedding.
+        linear2(silu(linear1(TimestepEmbedder.sinusoidal(t * ZImageConfig.DiT.tScale, dim: freqDim))))
     }
     static func sinusoidal(_ t: MLXArray, dim: Int) -> MLXArray {
         let half = dim / 2
@@ -63,26 +64,24 @@ final class ZImageXEmbedder: Module {
 
 /// Final layer: AdaLN-modulated norm + projection back to patched-latent channels. The reference
 /// keys only `linear` and `adaLN_modulation.0` — `norm_final` carries NO learnable params, so it's
-/// applied parameter-free (NextDiT uses `LayerNorm(elementwise_affine: false)`; the exact form is a
-/// numeric detail to validate). `adaLN_modulation.0` outputs `[shift ; scale]`.
+/// applied parameter-free (`LayerNorm(elementwise_affine: false)`). The reference modulation is
+/// SCALE-ONLY (`scale = 1 + adaLN(silu(t))`, output dim = `dim`), with no additive shift.
 final class ZImageFinalLayer: Module {
     @ModuleInfo(key: "linear") var linear: Linear
     @ModuleInfo(key: "adaLN_modulation") var adaLNModulation: [Linear]
     private let eps: Float = 1e-6
     init(dim: Int, outDim: Int) {
         self._linear.wrappedValue = Linear(dim, outDim, bias: true)
-        self._adaLNModulation.wrappedValue = [Linear(dim, 2 * dim, bias: true)]
+        self._adaLNModulation.wrappedValue = [Linear(dim, dim, bias: true)]
         super.init()
     }
     func callAsFunction(_ x: MLXArray, timeEmb: MLXArray) -> MLXArray {
-        let parts = split(adaLNModulation[0](silu(timeEmb)), parts: 2, axis: -1)
-        let shift = expandedDimensions(parts[0], axis: 1)
-        let scale = expandedDimensions(parts[1], axis: 1)
-        // Parameter-free LayerNorm (no affine), then AdaLN scale/shift.
+        let scale = expandedDimensions(adaLNModulation[0](silu(timeEmb)), axis: 1)
+        // Parameter-free LayerNorm (no affine), then scale-only AdaLN.
         let mean = x.mean(axis: -1, keepDims: true)
         let variance = x.variance(axis: -1, keepDims: true)
         let normed = (x - mean) * rsqrt(variance + eps)
-        return linear(normed * (1 + scale) + shift)
+        return linear(normed * (1 + scale))
     }
 }
 
@@ -156,43 +155,47 @@ public final class ZImageDenoiser: Module, Denoiser {
         super.init()
     }
 
+    // image-token count for the current step (set in `embed`, used to slice in `unembed`).
+    private var imageTokenCount = 0
+
     /// Patchify the latent, refine the image and caption streams, and build the single-stream
-    /// sequence [caption ; image] for the main layers.
+    /// sequence [image ; caption] for the main layers (reference order: image tokens first).
     public func embed(latent: MLXArray, timestep: MLXArray, conditioning: Conditioning) -> MLXArray {
         let b = latent.dim(0), c = latent.dim(1), h = latent.dim(2), w = latent.dim(3)
         let p = ZImageConfig.DiT.patchSize
         hp = h / p; wp = w / p
-        // [B,C,H,W] -> [B, hp*wp, C*p*p]
+        // [B,C,H,W] -> [B, hp*wp, p*p*C]  (channels LAST within each patch token, per reference)
         let patches = latent
             .reshaped([b, c, hp, p, wp, p])
-            .transposed(0, 2, 4, 1, 3, 5)
-            .reshaped([b, hp * wp, c * p * p])
+            .transposed(0, 2, 4, 3, 5, 1)        // [b, hp, wp, p1, p2, C]
+            .reshaped([b, hp * wp, p * p * c])
 
         let timeEmb = tEmbedder(timestep)        // [B, dim]
         lastTimeEmb = timeEmb
 
         var imageTokens = allXEmbedder(patches)              // [B, N, dim]
         for block in noiseRefiner { imageTokens = block(imageTokens, timeEmb: timeEmb) }
+        imageTokenCount = imageTokens.dim(1)
 
         var captionTokens = capEmbedder(conditioning.embeddings)   // [B, L, dim]
         for block in contextRefiner { captionTokens = block(captionTokens, timeEmb: nil) }
         captionLength = captionTokens.dim(1)
 
-        return concatenated([captionTokens, imageTokens], axis: 1) // [B, L+N, dim]
+        return concatenated([imageTokens, captionTokens], axis: 1) // [B, N+L, dim]
     }
 
     /// Drop the caption tokens, project the image tokens back to patched latent, and unpatchify.
     public func unembed(_ hidden: MLXArray) -> MLXArray {
-        let imageTokens = split(hidden, indices: [captionLength], axis: 1)[1]   // [B, N, dim]
+        let imageTokens = split(hidden, indices: [imageTokenCount], axis: 1)[0]  // [B, N, dim] (front)
         let timeEmb = lastTimeEmb ?? zeros([imageTokens.dim(0), ZImageConfig.DiT.dim])
-        let patches = allFinalLayer(imageTokens, timeEmb: timeEmb)               // [B, N, C*p*p]
+        let patches = allFinalLayer(imageTokens, timeEmb: timeEmb)               // [B, N, p*p*C]
         let p = ZImageConfig.DiT.patchSize
         let c = ZImageConfig.DiT.vaeLatentChannels
         let bs = patches.dim(0)
-        // [B, N, C*p*p] -> [B, C, H, W]
+        // [B, N, p*p*C] -> [B, C, H, W]  (inverse of the channel-last patchify)
         return patches
-            .reshaped([bs, hp, wp, c, p, p])
-            .transposed(0, 3, 1, 4, 2, 5)
+            .reshaped([bs, hp, wp, p, p, c])     // (p1, p2, C) layout
+            .transposed(0, 5, 1, 3, 2, 4)        // [b, C, hp, p1, wp, p2]
             .reshaped([bs, c, hp * p, wp * p])
     }
 }

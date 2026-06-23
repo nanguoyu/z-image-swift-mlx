@@ -106,6 +106,11 @@ public final class Qwen3TextEncoder: Module {
     }
 
     /// `tokens` is `[B, N]` Int32 token ids. Returns the layer[-2] hidden state.
+    ///
+    /// Uses a length-only causal mask, which is correct for a SINGLE unpadded sequence (the current
+    /// batch=1 encode path). Batched inference must pad to a common length and pass the per-token
+    /// padding mask (combined with the causal mask) plus mask-derived RoPE positions — the reference
+    /// pads to max_length and then selects the unpadded positions.
     public func hiddenStates(_ tokens: MLXArray) -> MLXArray {
         var h = embedTokens(tokens)
         let mask = MultiHeadAttention.createAdditiveCausalMask(tokens.dim(1)).asType(h.dtype)

@@ -17,6 +17,18 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 > quantizes the 4-bit Linears, transposes conv weights OIHW→OHWI, and filters to module
 > destinations, so the three trees load exactly.
 >
+> **Forward shape-consistency verified** (MLX lazy graph; shapes inferred without `eval`, so the 6B
+> params are never materialized): `embed → 30 blocks → unembed` round-trips a `[1,16,16,16]` latent,
+> and VAE `decode`/`encode` shape correctly. This catches forward dim bugs the path diff can't.
+>
+> **Audit applied** (adversarial review vs the official Tongyi-MAI/Z-Image code + the authoritative
+> HF configs): Z-Image uses the **FLUX VAE** (latent **16** ch, scale **0.3611**, shift **0.1159**,
+> no quant convs) — not the SD VAE; DiT `in_channels=16`, `patch_size=2` ⇒ patch dim **64** (the
+> x-embedder is `Linear(64→3840)`); patches are channels-**last** `(p1,p2,C)`; the single stream is
+> `[image ; caption]`; the final layer's AdaLN is **scale-only** (`1+adaLN(t)`, dim→dim, no shift);
+> timestep is scaled by **t_scale=1000** before embedding; the VAE downsample uses diffusers'
+> asymmetric `(0,1,0,1)` pad. n_heads=n_kv_heads=30 (DiT is full MHA, not GQA).
+>
 > **Remaining (all need a GPU / the ~8 GB download):** the real 3D-axes RoPE (1D placeholder now);
 > resolving the tokenizer + weights from the downloaded model folder rather than the hub id; and
 > **numeric parity vs the Python reference** (the key-diff gate checks structure, not values —
@@ -26,8 +38,9 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 ## Components & sizes
 
 ### S3-DiT transformer (single-stream)
-- `dim = 3840`, `heads = 30`, `headDim = 128`, `latentChannels = 16` (VAE 4ch × 2×2 patch),
-  `patch = 2`, FFN hidden `= int(dim/3*8) = 10240` (SwiGLU `w2(silu(w1 x) * w3 x)`, no bias).
+- `dim = 3840`, `heads = 30` (`n_kv_heads = 30` ⇒ full MHA), `headDim = 128`, `in_channels = 16`
+  (FLUX-VAE latent), `patch = 2` ⇒ patch dim `16×2×2 = 64`, FFN hidden `= int(dim/3*8) = 10240`
+  (SwiGLU `w2(silu(w1 x) * w3 x)`, no bias). `t_scale = 1000` (timestep ×1000 before embedding).
 - 30 main `layers` + 2 `noise_refiner` + 2 `context_refiner` blocks.
 - RMSNorm (eps 1e-5). QK-norm: RMSNorm per head (dim 128) on Q and K before attention.
 - RoPE: theta 256, 3D axes `dims=[32,48,48]`, `lens=[1536,512,512]`.
@@ -44,9 +57,10 @@ can't expose hidden states — use it only for the `Qwen2Tokenizer` + chat templ
   RoPE theta 1e6. Extract the **second-to-last** hidden state (layer index -2), dim 2560,
   max seq 512, chat template with `enable_thinking=True`.
 
-### VAE (AutoencoderKL, standard SD-style)
-- latent 4ch, 8× downsample, scale `0.18215`, block channels `[128,256,512,512]`, 2 resnets/block,
-  attention in the mid block, GroupNorm 32.
+### VAE (AutoencoderKL, FLUX-family)
+- latent **16ch**, 8× downsample, scale `0.3611`, shift `0.1159`, **no** quant/post-quant conv,
+  block channels `[128,256,512,512]`, 2 resnets/block (decoder 3), attention in the mid block,
+  GroupNorm 32. Decode: `latent/scale + shift`; encode: `(mean − shift)·scale`.
 
 ### Scheduler
 - Flow-match Euler, **shift 3.0**, default **8 steps** (Turbo). Already implemented as

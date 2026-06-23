@@ -11,6 +11,7 @@ let package = Package(
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "ZImageMLX", targets: ["ZImageMLX"]),
+        .executable(name: "zimage-demo", targets: ["zimage-demo"]),
     ],
     dependencies: [
         .package(url: "https://github.com/nanguoyu/swift-diffusion-core", branch: "main"),
@@ -29,6 +30,14 @@ let package = Package(
                 .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ]
+        ),
+        // Tiny CLI: `swift run zimage-demo <model-dir> "<prompt>" [size] [steps] [out.png]`.
+        // For `swift run` on Xcode 26, copy an Xcode-built MLX `default.metallib` to
+        // `mlx.metallib` beside the executable (see README); Xcode runs need no extra steps.
+        .executableTarget(
+            name: "zimage-demo",
+            dependencies: ["ZImageMLX"],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "/usr/lib"])]
         ),
     ]
 )

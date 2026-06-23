@@ -4,10 +4,13 @@ Reference-grounded architecture map for porting Z-Image to Swift + MLX. Sources:
 [`Tongyi-MAI/Z-Image`](https://github.com/Tongyi-MAI/Z-Image) modeling code, the HF model configs
 (`Tongyi-MAI/Z-Image-Turbo`, community MLX repo `deepsweet/Z-Image-Turbo-6B-MLX-Q4`).
 
-> **Status:** `ZImageConfig` + the S3-DiT building-block modules (`ZImageFeedForward`,
-> `ZImageAttention`, `ZImageTransformerBlock`) are implemented and compile against MLXNN. The
-> full forward (denoiser assembly, Qwen3-4B encoder, VAE) is the remaining work — and its
-> **numerics must be validated on a GPU against the Python reference**; nothing here has run.
+> **Status (compile-verified; numerics unvalidated):** `ZImageConfig`, the S3-DiT blocks
+> (`ZImageFeedForward`/`ZImageAttention`/`ZImageTransformerBlock`), the **Qwen3-4B encoder**
+> (`Qwen3TextEncoder`), and the **denoiser assembly** (`ZImageDenoiser` conforming to `Denoiser`:
+> patchify → single-stream → AdaLN blocks → unembed; `makeDenoiser` returns it) all compile
+> against MLXNN. **Remaining:** VAE decode/encode; 4-bit weight loading into the module tree (key
+> map below); tokenizer wiring (`Qwen2Tokenizer` + chat template); the real 3D-axes RoPE
+> (currently a 1D placeholder); and **GPU numeric parity vs the Python reference** — nothing has run.
 
 ## Components & sizes
 

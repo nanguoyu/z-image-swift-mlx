@@ -35,7 +35,6 @@ final class ZImageAttention: Module {
     @ModuleInfo(key: "to_out") var toOut: [Linear]
     @ModuleInfo(key: "norm_q") var normQ: RMSNorm
     @ModuleInfo(key: "norm_k") var normK: RMSNorm
-    let rope: RoPE
 
     init(dim: Int = ZImageConfig.DiT.dim,
          heads: Int = ZImageConfig.DiT.heads,
@@ -47,17 +46,18 @@ final class ZImageAttention: Module {
         self._toOut.wrappedValue = [Linear(heads * headDim, dim, bias: false)]
         self._normQ.wrappedValue = RMSNorm(dimensions: headDim, eps: ZImageConfig.DiT.rmsEps)
         self._normK.wrappedValue = RMSNorm(dimensions: headDim, eps: ZImageConfig.DiT.rmsEps)
-        // Placeholder 1D RoPE; the reference uses 3D-axes RoPE (see IMPLEMENTATION.md).
-        self.rope = RoPE(dimensions: headDim, traditional: false, base: ZImageConfig.DiT.ropeTheta)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    /// `cos`/`sin` are the `[N, 64]` 3D-RoPE tables for the tokens being processed (per-segment in
+    /// the refiners, unified in the main layers). Applied to q/k after QK-RMSNorm; v is untouched.
+    func callAsFunction(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> MLXArray {
         let b = x.dim(0), n = x.dim(1)
         var q = normQ(toQ(x).reshaped([b, n, heads, headDim])).transposed(0, 2, 1, 3)
         var k = normK(toK(x).reshaped([b, n, heads, headDim])).transposed(0, 2, 1, 3)
         let v = toV(x).reshaped([b, n, heads, headDim]).transposed(0, 2, 1, 3)
-        q = rope(q); k = rope(k)
+        q = ZImageRoPE.apply(q, cos: cos, sin: sin)
+        k = ZImageRoPE.apply(k, cos: cos, sin: sin)
         let out = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v, scale: 1.0 / sqrt(Float(headDim)), mask: nil)
         return toOut[0](out.transposed(0, 2, 1, 3).reshaped([b, n, heads * headDim]))
@@ -83,24 +83,25 @@ final class ZImageTransformerBlock: Module {
         self._attentionNorm2.wrappedValue = RMSNorm(dimensions: dim, eps: ZImageConfig.DiT.rmsEps)
         self._ffnNorm1.wrappedValue = RMSNorm(dimensions: dim, eps: ZImageConfig.DiT.rmsEps)
         self._ffnNorm2.wrappedValue = RMSNorm(dimensions: dim, eps: ZImageConfig.DiT.rmsEps)
-        self._adaLNModulation.wrappedValue = hasAdaLN ? [Linear(dim, 4 * dim, bias: true)] : []
+        self._adaLNModulation.wrappedValue =
+            hasAdaLN ? [Linear(ZImageConfig.DiT.adaLNInputDim, 4 * dim, bias: true)] : []
         super.init()
     }
 
-    /// `timeEmb` is the timestep embedding `[B, dim]`; ignored by context_refiner blocks.
-    /// NOTE: exact AdaLN/refiner numerics need reference validation.
-    func callAsFunction(_ x: MLXArray, timeEmb: MLXArray?) -> MLXArray {
+    /// `timeEmb` is the timestep embedding `[B, dim]`; ignored by context_refiner blocks. `cos`/`sin`
+    /// are the 3D-RoPE tables for the tokens being processed. NOTE: exact AdaLN numerics need parity.
+    func callAsFunction(_ x: MLXArray, timeEmb: MLXArray?, cos: MLXArray, sin: MLXArray) -> MLXArray {
         if let ada = adaLNModulation.first, let t = timeEmb {
             let parts = split(ada(silu(t)), parts: 4, axis: -1)
             let scaleAttn = expandedDimensions(parts[0], axis: 1)
             let gateAttn = expandedDimensions(parts[1], axis: 1)
             let scaleFFN = expandedDimensions(parts[2], axis: 1)
             let gateFFN = expandedDimensions(parts[3], axis: 1)
-            var h = x + gateAttn * attentionNorm2(attention(attentionNorm1(x) * (1 + scaleAttn)))
+            var h = x + gateAttn * attentionNorm2(attention(attentionNorm1(x) * (1 + scaleAttn), cos: cos, sin: sin))
             h = h + gateFFN * ffnNorm2(feedForward(ffnNorm1(h) * (1 + scaleFFN)))
             return h
         } else {
-            var h = x + attentionNorm2(attention(attentionNorm1(x)))
+            var h = x + attentionNorm2(attention(attentionNorm1(x), cos: cos, sin: sin))
             h = h + ffnNorm2(feedForward(ffnNorm1(h)))
             return h
         }

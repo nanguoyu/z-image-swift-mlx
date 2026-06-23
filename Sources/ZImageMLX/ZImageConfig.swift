@@ -19,6 +19,8 @@ public enum ZImageConfig {
         public static let ffnHidden = 10240        // int(dim / 3 * 8)
         public static let rmsEps: Float = 1e-5     // norm_eps
         public static let captionDim = 2560        // text-encoder hidden (cap_feat_dim), projected to `dim`
+        public static let adaLNInputDim = 256       // ADALN_EMBED_DIM: t_embedder output → adaLN input
+        public static let tEmbedderHidden = 1024    // t_embedder MLP hidden (256 → 1024 → 256)
         public static let ropeTheta: Float = 256
         public static let ropeAxesDims = [32, 48, 48]
         public static let ropeAxesLens = [1536, 512, 512]

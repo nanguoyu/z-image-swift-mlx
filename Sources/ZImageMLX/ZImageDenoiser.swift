@@ -15,14 +15,17 @@ import Foundation
 // `x_pad_token`, `cap_pad_token`. The forward numerics — 3D-axes RoPE (1D placeholder), AdaLN
 // application, the refiner flow, and pad-token handling — still need GPU parity validation.
 
-/// Timestep → sinusoidal embedding → MLP → `dim`. Keys: `t_embedder.linear1`, `t_embedder.linear2`.
+/// Timestep → sinusoidal(256) → MLP → 256-dim embedding (ADALN_EMBED_DIM, the input to every
+/// block's AdaLN). Keys: `t_embedder.linear1` (256→1024), `t_embedder.linear2` (1024→256).
 final class TimestepEmbedder: Module {
     @ModuleInfo(key: "linear1") var linear1: Linear
     @ModuleInfo(key: "linear2") var linear2: Linear
-    private let freqDim = 256
+    private let freqDim = ZImageConfig.DiT.adaLNInputDim
     init(dim: Int) {
-        self._linear1.wrappedValue = Linear(256, dim)
-        self._linear2.wrappedValue = Linear(dim, dim)
+        let freq = ZImageConfig.DiT.adaLNInputDim
+        let hidden = ZImageConfig.DiT.tEmbedderHidden
+        self._linear1.wrappedValue = Linear(freq, hidden)
+        self._linear2.wrappedValue = Linear(hidden, freq)
         super.init()
     }
     func callAsFunction(_ t: MLXArray) -> MLXArray {
@@ -39,10 +42,13 @@ final class TimestepEmbedder: Module {
     }
 }
 
-/// Caption projection: RMSNorm + Linear (2560 → dim). Keys: `cap_embedder.{0,1}`.
+/// Caption projection: RMSNorm + Linear (2560 → dim). The reference keys these `cap_embedder.{0,1}`
+/// (an `nn.Sequential`), but a mixed module ARRAY where only the non-first element is quantized
+/// can't be updated by MLXNN (`[.none, .value]` first-element-`.none` is unsupported). So this is a
+/// named-key module (`norm`/`proj`) and `ZImageWeights` remaps the checkpoint's `0`/`1` keys on load.
 final class CaptionEmbedder: Module {
-    @ModuleInfo(key: "0") var norm: RMSNorm
-    @ModuleInfo(key: "1") var proj: Linear
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+    @ModuleInfo(key: "proj") var proj: Linear
     init(inDim: Int, dim: Int) {
         self._norm.wrappedValue = RMSNorm(dimensions: inDim, eps: ZImageConfig.DiT.rmsEps)
         self._proj.wrappedValue = Linear(inDim, dim, bias: true)
@@ -72,7 +78,7 @@ final class ZImageFinalLayer: Module {
     private let eps: Float = 1e-6
     init(dim: Int, outDim: Int) {
         self._linear.wrappedValue = Linear(dim, outDim, bias: true)
-        self._adaLNModulation.wrappedValue = [Linear(dim, dim, bias: true)]
+        self._adaLNModulation.wrappedValue = [Linear(ZImageConfig.DiT.adaLNInputDim, dim, bias: true)]
         super.init()
     }
     func callAsFunction(_ x: MLXArray, timeEmb: MLXArray) -> MLXArray {
@@ -95,24 +101,36 @@ final class ZImageFinalLayerDict: Module {
     func callAsFunction(_ x: MLXArray, timeEmb: MLXArray) -> MLXArray { layer(x, timeEmb: timeEmb) }
 }
 
+/// Shared, per-step holder for the UNIFIED-sequence 3D-RoPE tables. `ZImageDenoiser.embed` sets
+/// these for the `[image ; caption]` sequence; each main `ZImageStreamableBlock` reads them. (The
+/// refiners build their own per-segment tables and pass them directly.)
+final class ZImageRopeHolder {
+    var cos = MLXArray([Float(0)])
+    var sin = MLXArray([Float(0)])
+}
+
 /// Adapts a main `ZImageTransformerBlock` to the engine's `StreamableBlock`. The block derives its
-/// AdaLN modulation from the timestep via the shared `TimestepEmbedder`. `load`/`release` are
-/// no-ops here (weights are resident); the iPhone streaming path will load per-block ranges.
+/// AdaLN modulation from the timestep via the shared `TimestepEmbedder` and its RoPE tables from the
+/// shared `ZImageRopeHolder`. `load`/`release` are no-ops here (weights are resident); the iPhone
+/// streaming path will load per-block ranges.
 final class ZImageStreamableBlock: StreamableBlock {
     let index: Int
     let approximateBytes: Int64
     private let block: ZImageTransformerBlock
     private let timeEmbedder: TimestepEmbedder
+    private let rope: ZImageRopeHolder
 
-    init(index: Int, block: ZImageTransformerBlock, timeEmbedder: TimestepEmbedder, approximateBytes: Int64) {
+    init(index: Int, block: ZImageTransformerBlock, timeEmbedder: TimestepEmbedder,
+         rope: ZImageRopeHolder, approximateBytes: Int64) {
         self.index = index
         self.block = block
         self.timeEmbedder = timeEmbedder
+        self.rope = rope
         self.approximateBytes = approximateBytes
     }
     func load(from source: WeightSource) throws {}
     func callAsFunction(_ x: MLXArray, conditioning: Conditioning, timestep: MLXArray) -> MLXArray {
-        block(x, timeEmb: timeEmbedder(timestep))
+        block(x, timeEmb: timeEmbedder(timestep), cos: rope.cos, sin: rope.sin)
     }
     func release() {}
 }
@@ -133,8 +151,12 @@ public final class ZImageDenoiser: Module, Denoiser {
     // Set during `embed`, used by `unembed` (same generation step).
     private var hp = 0, wp = 0, captionLength = 0
     private var lastTimeEmb: MLXArray?
+    // Unified-sequence RoPE tables, shared with the main streamable blocks (set in `embed`).
+    private let ropeHolder: ZImageRopeHolder
 
     public override init() {
+        let holder = ZImageRopeHolder()
+        self.ropeHolder = holder
         let dim = ZImageConfig.DiT.dim
         let te = TimestepEmbedder(dim: dim)
         self._tEmbedder.wrappedValue = te
@@ -150,7 +172,7 @@ public final class ZImageDenoiser: Module, Denoiser {
         self._xPadToken.wrappedValue = zeros([1, dim])
         self._capPadToken.wrappedValue = zeros([1, dim])
         self.blocks = main.enumerated().map { i, b in
-            ZImageStreamableBlock(index: i, block: b, timeEmbedder: te, approximateBytes: 120_000_000)
+            ZImageStreamableBlock(index: i, block: b, timeEmbedder: te, rope: holder, approximateBytes: 120_000_000)
         }
         super.init()
     }
@@ -164,6 +186,16 @@ public final class ZImageDenoiser: Module, Denoiser {
         let b = latent.dim(0), c = latent.dim(1), h = latent.dim(2), w = latent.dim(3)
         let p = ZImageConfig.DiT.patchSize
         hp = h / p; wp = w / p
+        let L = conditioning.embeddings.dim(1)
+
+        // 3D-RoPE tables: per-segment (refiners) + unified (main layers). Caption is numbered first
+        // on the t-axis; image patches share t=L+1 with (h=row, w=col) in h-outer/w-inner raster.
+        let pos = ZImageRoPE.positions(hp: hp, wp: wp, captionLength: L)
+        let (imgCos, imgSin) = ZImageRoPE.tables(posT: pos.imgT, posH: pos.imgH, posW: pos.imgW)
+        let (capCos, capSin) = ZImageRoPE.tables(posT: pos.capT, posH: pos.capH, posW: pos.capW)
+        ropeHolder.cos = concatenated([imgCos, capCos], axis: 0)   // unified [image ; caption]
+        ropeHolder.sin = concatenated([imgSin, capSin], axis: 0)
+
         // [B,C,H,W] -> [B, hp*wp, p*p*C]  (channels LAST within each patch token, per reference)
         let patches = latent
             .reshaped([b, c, hp, p, wp, p])
@@ -174,11 +206,11 @@ public final class ZImageDenoiser: Module, Denoiser {
         lastTimeEmb = timeEmb
 
         var imageTokens = allXEmbedder(patches)              // [B, N, dim]
-        for block in noiseRefiner { imageTokens = block(imageTokens, timeEmb: timeEmb) }
+        for block in noiseRefiner { imageTokens = block(imageTokens, timeEmb: timeEmb, cos: imgCos, sin: imgSin) }
         imageTokenCount = imageTokens.dim(1)
 
         var captionTokens = capEmbedder(conditioning.embeddings)   // [B, L, dim]
-        for block in contextRefiner { captionTokens = block(captionTokens, timeEmb: nil) }
+        for block in contextRefiner { captionTokens = block(captionTokens, timeEmb: nil, cos: capCos, sin: capSin) }
         captionLength = captionTokens.dim(1)
 
         return concatenated([imageTokens, captionTokens], axis: 1) // [B, N+L, dim]

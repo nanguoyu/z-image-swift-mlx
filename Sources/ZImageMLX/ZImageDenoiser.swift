@@ -130,7 +130,8 @@ final class ZImageStreamableBlock: StreamableBlock {
     }
     func load(from source: WeightSource) throws {}
     func callAsFunction(_ x: MLXArray, conditioning: Conditioning, timestep: MLXArray) -> MLXArray {
-        block(x, timeEmb: timeEmbedder(timestep), cos: rope.cos, sin: rope.sin)
+        // Z-Image conditions on (1 - sigma): t=0 at the noisy end, t→1 toward clean.
+        block(x, timeEmb: timeEmbedder(1.0 - timestep), cos: rope.cos, sin: rope.sin)
     }
     func release() {}
 }
@@ -202,7 +203,7 @@ public final class ZImageDenoiser: Module, Denoiser {
             .transposed(0, 2, 4, 3, 5, 1)        // [b, hp, wp, p1, p2, C]
             .reshaped([b, hp * wp, p * p * c])
 
-        let timeEmb = tEmbedder(timestep)        // [B, dim]
+        let timeEmb = tEmbedder(1.0 - timestep)  // condition on (1 - sigma); [B, 256]
         lastTimeEmb = timeEmb
 
         var imageTokens = allXEmbedder(patches)              // [B, N, dim]
@@ -225,9 +226,12 @@ public final class ZImageDenoiser: Module, Denoiser {
         let c = ZImageConfig.DiT.vaeLatentChannels
         let bs = patches.dim(0)
         // [B, N, p*p*C] -> [B, C, H, W]  (inverse of the channel-last patchify)
-        return patches
+        let velocity = patches
             .reshaped([bs, hp, wp, p, p, c])     // (p1, p2, C) layout
             .transposed(0, 5, 1, 3, 2, 4)        // [b, C, hp, p1, wp, p2]
             .reshaped([bs, c, hp * p, wp * p])
+        // Z-Image's raw flow field is negated before the Euler step (`noise_pred = -noise_pred`),
+        // so the generic engine update `x + (σ_next − σ)·v` integrates toward the data manifold.
+        return -velocity
     }
 }

@@ -92,11 +92,14 @@ final class ZImageTransformerBlock: Module {
     /// are the 3D-RoPE tables for the tokens being processed. NOTE: exact AdaLN numerics need parity.
     func callAsFunction(_ x: MLXArray, timeEmb: MLXArray?, cos: MLXArray, sin: MLXArray) -> MLXArray {
         if let ada = adaLNModulation.first, let t = timeEmb {
-            let parts = split(ada(silu(t)), parts: 4, axis: -1)
+            // Block adaLN: a single Linear (NO leading SiLU) → [scale_msa, gate_msa, scale_mlp,
+            // gate_mlp]; scales used as (1 + scale), gates are tanh'd. (The final layer differs:
+            // it DOES have a leading SiLU and is scale-only.)
+            let parts = split(ada(t), parts: 4, axis: -1)
             let scaleAttn = expandedDimensions(parts[0], axis: 1)
-            let gateAttn = expandedDimensions(parts[1], axis: 1)
+            let gateAttn = expandedDimensions(tanh(parts[1]), axis: 1)
             let scaleFFN = expandedDimensions(parts[2], axis: 1)
-            let gateFFN = expandedDimensions(parts[3], axis: 1)
+            let gateFFN = expandedDimensions(tanh(parts[3]), axis: 1)
             var h = x + gateAttn * attentionNorm2(attention(attentionNorm1(x) * (1 + scaleAttn), cos: cos, sin: sin))
             h = h + gateFFN * ffnNorm2(feedForward(ffnNorm1(h) * (1 + scaleFFN)))
             return h

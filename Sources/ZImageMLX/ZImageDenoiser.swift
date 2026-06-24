@@ -111,30 +111,99 @@ final class ZImageRopeHolder {
 }
 
 /// Adapts a main `ZImageTransformerBlock` to the engine's `StreamableBlock`. The block derives its
-/// AdaLN modulation from the timestep via the shared `TimestepEmbedder` and its RoPE tables from the
-/// shared `ZImageRopeHolder`. `load`/`release` are no-ops here (weights are resident); the iPhone
-/// streaming path will load per-block ranges.
+/// AdaLN modulation from the timestep via the shared (resident) `TimestepEmbedder` and its RoPE
+/// tables from the shared (resident) `ZImageRopeHolder`.
+///
+/// Two residency modes, distinguished by which initializer built the owning `ZImageDenoiser`:
+///
+/// • RESIDENT mode (`resident != nil`): the whole `layers.*` subtree was loaded once by the
+///   whole-tree loader (the verified `ZImagePipeline` macOS path). The block instance is held
+///   resident in `ZImageDenoiser.layersList`; this adapter just forwards to it. `load`/`release`
+///   are no-ops — there is nothing per-step to load or free.
+///
+/// • STREAMING mode (`resident == nil`): nothing is built up front. The adapter owns its key
+///   `prefix` (e.g. `"layers.0."`) and a `WeightSource`-fed per-block loader. `load(from:)` builds
+///   a fresh `ZImageTransformerBlock` and fills it via `ZImageWeights.loadBlock(prefix:from:into:)`,
+///   retaining it in `streamed`; `callAsFunction` runs it; `release()` drops the only strong ref so
+///   the engine's `GPU.clearCache()` actually frees the ~120 MB block (R2). Calling the block before
+///   `load` (or after `release`) is a programming error and traps with a clear message.
 final class ZImageStreamableBlock: StreamableBlock {
     let index: Int
     let approximateBytes: Int64
-    private let block: ZImageTransformerBlock
+    private let prefix: String
     private let timeEmbedder: TimestepEmbedder
     private let rope: ZImageRopeHolder
+    private let hasAdaLN: Bool
+    private let groupSize: Int
+    private let bits: Int
+    /// Hidden width used when (re)building the streamed block. Defaults to the real S3-DiT width;
+    /// injectable so unit tests can exercise the build/load/release path with a tiny block.
+    private let dim: Int
 
-    init(index: Int, block: ZImageTransformerBlock, timeEmbedder: TimestepEmbedder,
+    /// RESIDENT mode: a pre-loaded block held by `ZImageDenoiser.layersList`. nil in streaming mode.
+    private let resident: ZImageTransformerBlock?
+    /// STREAMING mode: built in `load(from:)`, dropped to nil in `release()`. nil in resident mode.
+    private var streamed: ZImageTransformerBlock?
+
+    /// RESIDENT initializer — forwards to a block already loaded in the denoiser tree.
+    init(index: Int, resident: ZImageTransformerBlock, timeEmbedder: TimestepEmbedder,
          rope: ZImageRopeHolder, approximateBytes: Int64) {
         self.index = index
-        self.block = block
+        self.prefix = "layers.\(index)."
+        self.resident = resident
         self.timeEmbedder = timeEmbedder
         self.rope = rope
         self.approximateBytes = approximateBytes
+        self.hasAdaLN = true
+        self.dim = ZImageConfig.DiT.dim
+        self.groupSize = 64
+        self.bits = 4
     }
-    func load(from source: WeightSource) throws {}
+
+    /// STREAMING initializer — owns its key prefix and loads per block, per step, from a source.
+    init(index: Int, prefix: String, hasAdaLN: Bool, timeEmbedder: TimestepEmbedder,
+         rope: ZImageRopeHolder, approximateBytes: Int64,
+         dim: Int = ZImageConfig.DiT.dim, groupSize: Int = 64, bits: Int = 4) {
+        self.index = index
+        self.prefix = prefix
+        self.resident = nil
+        self.timeEmbedder = timeEmbedder
+        self.rope = rope
+        self.approximateBytes = approximateBytes
+        self.hasAdaLN = hasAdaLN
+        self.dim = dim
+        self.groupSize = groupSize
+        self.bits = bits
+    }
+
+    func load(from source: WeightSource) throws {
+        guard resident == nil else { return }            // resident mode: nothing to load
+        // Build a fresh block and fill ONLY this prefix's tensors from the source, then retain it.
+        // (Re)building per load keeps residency at one block — the previous one was dropped in
+        // `release()`; we never accumulate.
+        let block = ZImageTransformerBlock(dim: dim, hasAdaLN: hasAdaLN)
+        try ZImageWeights.loadBlock(prefix: prefix, from: source, into: block,
+                                    groupSize: groupSize, bits: bits)
+        streamed = block
+    }
+
     func callAsFunction(_ x: MLXArray, conditioning: Conditioning, timestep: MLXArray) -> MLXArray {
         // Z-Image conditions on (1 - sigma): t=0 at the noisy end, t→1 toward clean.
-        block(x, timeEmb: timeEmbedder(1.0 - timestep), cos: rope.cos, sin: rope.sin)
+        guard let block = resident ?? streamed else {
+            fatalError("ZImageStreamableBlock[\(index)] run before load(from:) (or after release())")
+        }
+        return block(x, timeEmb: timeEmbedder(1.0 - timestep), cos: rope.cos, sin: rope.sin)
     }
-    func release() {}
+
+    func release() {
+        // Drop the only strong ref so MLX can free the block's arrays once the engine clearCache()s.
+        // No-op in resident mode (the block lives in the denoiser tree for the whole run).
+        streamed = nil
+    }
+
+    /// Test/diagnostic hook: is a streamed block currently held resident? (false in resident mode
+    /// after construction, since resident blocks are never tracked here.)
+    var isStreamedBlockResident: Bool { streamed != nil }
 }
 
 public final class ZImageDenoiser: Module, Denoiser {
@@ -156,7 +225,19 @@ public final class ZImageDenoiser: Module, Denoiser {
     // Unified-sequence RoPE tables, shared with the main streamable blocks (set in `embed`).
     private let ropeHolder: ZImageRopeHolder
 
-    public override init() {
+    /// `streaming` selects the residency of the 30 main `layers.*` blocks:
+    ///
+    /// • `false` (default) — RESIDENT. Build all 30 `ZImageTransformerBlock`s eagerly into
+    ///   `layersList` so the whole-tree loader (`ZImageWeights.load`) can fill them in one pass.
+    ///   This is the verified macOS `ZImagePipeline` path; `blocks` forward to those instances and
+    ///   their `load`/`release` are no-ops.
+    ///
+    /// • `true` — STREAMING. Leave `layersList` EMPTY (no ~120 MB × 30 resident transformer); each
+    ///   `ZImageStreamableBlock` owns its `layers.N.` prefix and loads/frees its own block per step
+    ///   from the engine's `WeightSource`, so transformer residency stays at one block. The small
+    ///   shared submodules (t_embedder, cap_embedder, x/final embedders, refiners, pad tokens, RoPE
+    ///   holder) stay resident in both modes.
+    public init(streaming: Bool = false) {
         let holder = ZImageRopeHolder()
         self.ropeHolder = holder
         let dim = ZImageConfig.DiT.dim
@@ -165,16 +246,29 @@ public final class ZImageDenoiser: Module, Denoiser {
         self._capEmbedder.wrappedValue = CaptionEmbedder(inDim: ZImageConfig.DiT.captionDim, dim: dim)
         self._allXEmbedder.wrappedValue = ZImageXEmbedder(dim: dim)
         self._allFinalLayer.wrappedValue = ZImageFinalLayerDict(dim: dim)
-        let main = (0..<ZImageConfig.DiT.layers).map { _ in ZImageTransformerBlock(dim: dim, hasAdaLN: true) }
-        self._layersList.wrappedValue = main
+        // The refiners are small (a handful of blocks) and shared across steps — keep them resident
+        // in both modes. Only the 30 main `layers.*` blocks dominate the 3.46 GB transformer.
         self._noiseRefiner.wrappedValue =
             (0..<ZImageConfig.DiT.noiseRefiners).map { _ in ZImageTransformerBlock(dim: dim, hasAdaLN: true) }
         self._contextRefiner.wrappedValue =
             (0..<ZImageConfig.DiT.contextRefiners).map { _ in ZImageTransformerBlock(dim: dim, hasAdaLN: false) }
         self._xPadToken.wrappedValue = zeros([1, dim])
         self._capPadToken.wrappedValue = zeros([1, dim])
-        self.blocks = main.enumerated().map { i, b in
-            ZImageStreamableBlock(index: i, block: b, timeEmbedder: te, rope: holder, approximateBytes: 120_000_000)
+
+        if streaming {
+            // No resident main blocks; the adapters load their own per step.
+            self._layersList.wrappedValue = []
+            self.blocks = (0..<ZImageConfig.DiT.layers).map { i in
+                ZImageStreamableBlock(index: i, prefix: "layers.\(i).", hasAdaLN: true,
+                                      timeEmbedder: te, rope: holder, approximateBytes: 120_000_000)
+            }
+        } else {
+            let main = (0..<ZImageConfig.DiT.layers).map { _ in ZImageTransformerBlock(dim: dim, hasAdaLN: true) }
+            self._layersList.wrappedValue = main
+            self.blocks = main.enumerated().map { i, b in
+                ZImageStreamableBlock(index: i, resident: b, timeEmbedder: te, rope: holder,
+                                      approximateBytes: 120_000_000)
+            }
         }
         super.init()
     }

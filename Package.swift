@@ -40,5 +40,17 @@ let package = Package(
             dependencies: ["ZImageMLX"],
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "/usr/lib"])]
         ),
+        // Unit tests. MLX needs xcodebuild (default.metallib + libc++ rpath); bare `swift test`
+        // can't run these. See README / the streaming-milestone notes.
+        .testTarget(
+            name: "ZImageMLXTests",
+            dependencies: [
+                "ZImageMLX",
+                .product(name: "DiffusionCore", package: "swift-diffusion-core"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ]
+        ),
     ]
 )

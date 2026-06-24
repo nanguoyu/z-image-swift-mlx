@@ -1,5 +1,5 @@
 {
-  "originHash" : "42b4ee1cdc73fce164b6050caa1b899c86d66b83cd2408ced1a26b0d30038613",
+  "originHash" : "c3342b5024877373358ada8f67a917efebe760e60ab3789f9f67b6c66a8912f1",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -61,7 +61,7 @@
       "location" : "https://github.com/nanguoyu/swift-diffusion-core",
       "state" : {
         "branch" : "main",
-        "revision" : "be6879a119ba52b7f29aacb0d6ae8f2eb57120e0"
+        "revision" : "34fcf055436448d24294fd9e30ad396632c31234"
       }
     },
     {

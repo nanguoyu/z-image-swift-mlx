@@ -44,8 +44,9 @@ final class Qwen3Attention: Module {
         self._kProj.wrappedValue = Linear(hidden, kvHeads * headDim, bias: false)
         self._vProj.wrappedValue = Linear(hidden, kvHeads * headDim, bias: false)
         self._oProj.wrappedValue = Linear(heads * headDim, hidden, bias: false)
-        self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: eps)
-        self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: eps)
+        // Qwen3's per-head q/k norms use MLX's default RMSNorm eps (1e-5), NOT the layer eps (1e-6).
+        self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: 1e-5)
+        self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: 1e-5)
         self.rope = RoPE(dimensions: headDim, traditional: false, base: ropeTheta)
         super.init()
     }
@@ -112,13 +113,16 @@ public final class Qwen3TextEncoder: Module {
     /// padding mask (combined with the causal mask) plus mask-derived RoPE positions — the reference
     /// pads to max_length and then selects the unpadded positions.
     public func hiddenStates(_ tokens: MLXArray) -> MLXArray {
-        var h = embedTokens(tokens)
+        // Run the full stack in fp32 (matches mflux), downcasting only the returned hidden[-2]. 35
+        // layers of bf16 accumulation is broadband conditioning error that shows as blotchiness in
+        // smooth/low-contrast background regions.
+        var h = embedTokens(tokens).asType(.float32)
         let mask = MultiHeadAttention.createAdditiveCausalMask(tokens.dim(1)).asType(h.dtype)
         let target = layers.count - 2   // output of the second-to-last layer == hidden[-2]
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask)
-            if i == target { return h }
+            if i == target { return h.asType(.bfloat16) }
         }
-        return h
+        return h.asType(.bfloat16)
     }
 }

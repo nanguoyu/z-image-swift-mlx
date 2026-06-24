@@ -322,6 +322,14 @@ public final class ZImageDenoiser: Module, Denoiser {
         imageTokenCount = imageTokens.dim(1)
 
         var captionTokens = capEmbedder(captionFeats)   // [B, L(padded to %32), dim]
+        if capPad > 0 {
+            // Replace the repeat-last pad slots with the learned cap_pad_token before the refiner +
+            // cross-modal attention (mflux: `mx.where(cap_pad_mask, cap_pad_token, cap_emb)`).
+            let dim = captionTokens.dim(2)
+            let real = captionTokens[0 ..< b, 0 ..< rawL, 0 ..< dim]
+            let pad = broadcast(capPadToken.reshaped([1, 1, dim]), to: [b, capPad, dim])
+            captionTokens = concatenated([real, pad], axis: 1)
+        }
         for block in contextRefiner { captionTokens = block(captionTokens, timeEmb: nil, cos: capCos, sin: capSin) }
         captionLength = captionTokens.dim(1)
 

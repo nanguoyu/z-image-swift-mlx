@@ -82,7 +82,11 @@ public final class ZImageArchitecture: DiffusionArchitecture, @unchecked Sendabl
         try ZImageWeights.loadShared(from: encSource, into: encoder, skipPrefixes: [])
 
         let messages: [Message] = [["role": "user", "content": prompt]]
-        let ids = try tok.applyChatTemplate(messages: messages)
+        // Match mflux's call (chat_template_kwargs={'enable_thinking': True}). The Qwen3 template only
+        // branches when enable_thinking is explicitly false, so this is a no-op vs the default, but it
+        // pins the prompt tokens to mflux's regardless of any tokenizer default.
+        let ids = try tok.applyChatTemplate(messages: messages, tools: nil,
+                                            additionalContext: ["enable_thinking": true])
         let length = min(ids.count, ZImageConfig.TextEncoder.maxSequenceLength)
         let tokens = MLXArray(ids.prefix(length).map { Int32($0) }).reshaped([1, length])
         let hidden = encoder.hiddenStates(tokens)   // [1, N, 2560]

@@ -56,7 +56,9 @@ public final class ZImagePipeline: @unchecked Sendable {
     public func encode(_ prompt: String) throws -> Conditioning {
         guard let encoder, let tokenizer else { throw PipelineError.notLoaded }
         let messages: [[String: String]] = [["role": "user", "content": prompt]]
-        let ids = try tokenizer.applyChatTemplate(messages: messages)
+        // Match mflux (enable_thinking=True); a no-op vs the Qwen3 default but pins the tokens.
+        let ids = try tokenizer.applyChatTemplate(messages: messages, tools: nil,
+                                                  additionalContext: ["enable_thinking": true])
         let length = min(ids.count, ZImageConfig.TextEncoder.maxSequenceLength)
         let tokens = MLXArray(ids.prefix(length).map { Int32($0) }).reshaped([1, length])
         return Conditioning(embeddings: encoder.hiddenStates(tokens))

@@ -282,7 +282,21 @@ public final class ZImageDenoiser: Module, Denoiser {
         let b = latent.dim(0), c = latent.dim(1), h = latent.dim(2), w = latent.dim(3)
         let p = ZImageConfig.DiT.patchSize
         hp = h / p; wp = w / p
-        let L = conditioning.embeddings.dim(1)
+
+        // Pad the caption to a multiple of 32 by repeating the last feature (mflux `_patchify`), so the
+        // padded length drives both the caption's RoPE t-range AND the image tokens' constant t-offset.
+        // The reference attends the padded (repeat-last) keys (all-ones mask), so no attention mask is
+        // needed — they just must be present + positioned. Without this the image t-coord is off by
+        // (-L) % 32 and the padded caption keys are missing, mis-aligning cross-modal attention.
+        let rawL = conditioning.embeddings.dim(1)
+        let capPad = (32 - rawL % 32) % 32
+        let L = rawL + capPad
+        var captionFeats = conditioning.embeddings
+        if capPad > 0 {
+            let d = conditioning.embeddings.dim(2)
+            let last = conditioning.embeddings[0 ..< b, (rawL - 1) ..< rawL, 0 ..< d]   // [B,1,D]
+            captionFeats = concatenated([captionFeats, broadcast(last, to: [b, capPad, d])], axis: 1)
+        }
 
         // 3D-RoPE tables: per-segment (refiners) + unified (main layers). Caption is numbered first
         // on the t-axis; image patches share t=L+1 with (h=row, w=col) in h-outer/w-inner raster.
@@ -305,7 +319,7 @@ public final class ZImageDenoiser: Module, Denoiser {
         for block in noiseRefiner { imageTokens = block(imageTokens, timeEmb: timeEmb, cos: imgCos, sin: imgSin) }
         imageTokenCount = imageTokens.dim(1)
 
-        var captionTokens = capEmbedder(conditioning.embeddings)   // [B, L, dim]
+        var captionTokens = capEmbedder(captionFeats)   // [B, L(padded to %32), dim]
         for block in contextRefiner { captionTokens = block(captionTokens, timeEmb: nil, cos: capCos, sin: capSin) }
         captionLength = captionTokens.dim(1)
 

@@ -94,9 +94,10 @@ final class ZImageTransformerBlock: Module {
         if let ada = adaLNModulation.first, let timeEmb {
             // Block adaLN: a single Linear (NO leading SiLU) → [scale_msa, gate_msa, scale_mlp,
             // gate_mlp]; scales used as (1 + scale), gates are tanh'd. (The final layer differs:
-            // it DOES have a leading SiLU and is scale-only.) Match the hidden dtype (bf16).
-            let t = timeEmb.asType(x.dtype)
-            let parts = split(ada(t), parts: 4, axis: -1)
+            // it DOES have a leading SiLU and is scale-only.) Keep `timeEmb` in fp32 through the
+            // Linear (matches mflux): the bf16×fp32 modulation promotes the residual stream to fp32,
+            // which the old bf16 downcast otherwise speckled.
+            let parts = split(ada(timeEmb), parts: 4, axis: -1)
             let scaleAttn = expandedDimensions(parts[0], axis: 1)
             let gateAttn = expandedDimensions(tanh(parts[1]), axis: 1)
             let scaleFFN = expandedDimensions(parts[2], axis: 1)

@@ -82,12 +82,14 @@ final class ZImageFinalLayer: Module {
         super.init()
     }
     func callAsFunction(_ x: MLXArray, timeEmb: MLXArray) -> MLXArray {
-        let scale = expandedDimensions(adaLNModulation[0](silu(timeEmb.asType(x.dtype))), axis: 1)
+        // Keep the timestep embedding fp32 through silu + the adaLN Linear (matches mflux), so the
+        // scale-only modulation and the final projection stay fp32.
+        let scale = expandedDimensions(adaLNModulation[0](silu(timeEmb)), axis: 1)
         // Parameter-free LayerNorm (no affine) computed in fp32 for stability, then scale-only AdaLN.
         let xf = x.asType(.float32)
         let mean = xf.mean(axis: -1, keepDims: true)
         let variance = xf.variance(axis: -1, keepDims: true)
-        let normed = ((xf - mean) * rsqrt(variance + eps)).asType(x.dtype)
+        let normed = (xf - mean) * rsqrt(variance + eps)
         return linear(normed * (1 + scale))
     }
 }

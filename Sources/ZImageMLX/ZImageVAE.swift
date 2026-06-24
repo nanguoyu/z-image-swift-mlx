@@ -14,7 +14,10 @@ import Foundation
 // parity validation.
 
 private func groupNorm(_ channels: Int) -> GroupNorm {
-    GroupNorm(groupCount: 32, dimensions: channels, eps: 1e-6, affine: true)
+    // pytorchCompatible: true → contiguous channel groups + fp32-internal `mx.fast.layer_norm`,
+    // matching mflux/PyTorch. MLX's DEFAULT (false) groups over interleaved/strided channels, which
+    // computes the wrong per-pixel mean/var and speckles the decoded image (the grain we chased).
+    GroupNorm(groupCount: 32, dimensions: channels, eps: 1e-6, affine: true, pytorchCompatible: true)
 }
 private func conv3(_ inC: Int, _ outC: Int, stride: Int = 1) -> Conv2d {
     Conv2d(inputChannels: inC, outputChannels: outC, kernelSize: 3,
@@ -36,11 +39,13 @@ final class Conv2dWrap: Module {
     init(_ c: Conv2d) { self._conv2d.wrappedValue = c; super.init() }
     func callAsFunction(_ x: MLXArray) -> MLXArray { conv2d(x) }
 }
-/// Norm-out wrapper: child GroupNorm keyed `norm` (e.g. `decoder.conv_norm_out.norm`).
+/// Norm-out wrapper: child GroupNorm keyed `norm` (e.g. `decoder.conv_norm_out.norm`). The norm is
+/// computed in fp32 then cast back: a bf16 GroupNorm's variance reduction speckles the output, and
+/// this is the final norm before the RGB conv (matches mflux's `.astype(float32)` on this norm).
 final class NormWrap: Module {
     @ModuleInfo(key: "norm") var norm: GroupNorm
     init(_ n: GroupNorm) { self._norm.wrappedValue = n; super.init() }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { norm(x) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray { norm(x.asType(.float32)).asType(x.dtype) }
 }
 
 /// ResNet block: GroupNorm→silu→Conv3 ×2 with an optional 1×1 shortcut. NHWC.
@@ -85,7 +90,8 @@ final class VAEAttention: Module {
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let b = x.dim(0), h = x.dim(1), w = x.dim(2), c = x.dim(3)
-        let normed = groupNormLayer(x).reshaped([b, h * w, c])
+        // GroupNorm in fp32 (matches mflux): the bf16 variance reduction otherwise speckles the output.
+        let normed = groupNormLayer(x.asType(.float32)).asType(x.dtype).reshaped([b, h * w, c])
         let q = toQ(normed).reshaped([b, 1, h * w, c])
         let k = toK(normed).reshaped([b, 1, h * w, c])
         let v = toV(normed).reshaped([b, 1, h * w, c])

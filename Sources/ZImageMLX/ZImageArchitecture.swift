@@ -39,7 +39,8 @@ public final class ZImageArchitecture: DiffusionArchitecture, @unchecked Sendabl
         defaultSampler: .flowMatchEuler,
         defaultSteps: 8,
         defaultGuidance: 1.0,
-        samplerShift: ZImageConfig.Scheduler.shift)
+        samplerShift: ZImageConfig.Scheduler.shift,
+        samplerShiftTerminal: ZImageConfig.Scheduler.shiftTerminal)
 
     public enum ArchitectureError: Error, CustomStringConvertible {
         case notComponentSource

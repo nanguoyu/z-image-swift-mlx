@@ -71,7 +71,8 @@ public final class ZImagePipeline: @unchecked Sendable {
         let factor = ZImageConfig.VAE.downsampleFactor
         guard size % (factor * ZImageConfig.DiT.patchSize) == 0 else { throw PipelineError.invalidSize(size) }
         let conditioning = try encode(prompt)
-        let sampler = FlowMatchEulerSampler(shift: ZImageConfig.Scheduler.shift)
+        let sampler = FlowMatchEulerSampler(shift: ZImageConfig.Scheduler.shift,
+                                            shiftTerminal: ZImageConfig.Scheduler.shiftTerminal)
         let sigmas = sampler.timesteps(steps: steps)
         let channels = ZImageConfig.VAE.latentChannels
         var latent = MLXRandom.normal([1, channels, size / factor, size / factor], key: MLXRandom.key(seed)).asType(.bfloat16)

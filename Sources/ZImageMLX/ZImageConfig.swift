@@ -50,9 +50,13 @@ public enum ZImageConfig {
         public static let blockChannels = [128, 256, 512, 512]
     }
 
-    /// Flow-match Euler scheduler (use `FlowMatchEulerSampler(shift:)`).
+    /// Flow-match Euler scheduler. Matches mflux's Z-Image schedule: exponential time-shift with
+    /// mu = 1 (so `shift = exp(1) ≈ 2.71828`, algebraically the same as the linear form) and a
+    /// `shift_terminal` of 0.02 so the last working sigma is 0.02 (the model isn't evaluated below
+    /// its calibrated range — going to ~0.003 produced grain).
     public enum Scheduler {
-        public static let shift: Float = 3.0
+        public static let shift: Float = 2.7182817   // exp(1)
+        public static let shiftTerminal: Float = 0.02
         public static let defaultSteps = 8
     }
 }

@@ -64,9 +64,41 @@ public struct ModelDownloader: Sendable {
     @discardableResult
     public func download(repoId: String, matching globs: [String] = [],
                          progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        #if os(iOS)
+        // On iOS a poisoned shared URLCache entry can replay a stale/empty repo file listing,
+        // making snapshot() "succeed" while downloading nothing. Force fresh metadata.
+        URLCache.shared.removeAllCachedResponses()
+        #endif
+
+        // An empty listing must never masquerade as a successful (empty) download — surface it.
+        let listed = (try? await Hub.getFilenames(from: Hub.Repo(id: repoId), matching: globs)) ?? []
+        guard !listed.isEmpty else { throw ModelDownloadError.emptyFileList(repoId) }
+
         let hub = HubApi(downloadBase: downloadBase)
-        return try await hub.snapshot(from: repoId, matching: globs) { (p: Progress) in
+        let url = try await hub.snapshot(from: repoId, matching: globs) { (p: Progress) in
             progress(p.fractionCompleted)
+        }
+        // A snapshot that returns "success" without materializing the weights (purged cache, no-op
+        // transfer, partial) must surface as a retriable error — not a corrupt success that later
+        // detonates as a missing-tensor error at generate time. Only meaningful for a full-repo fetch
+        // (globs == []); a partial fetch wouldn't satisfy isDownloaded.
+        if globs.isEmpty, !isDownloaded(repoId: repoId) {
+            throw ModelDownloadError.incompleteDownload(repoId)
+        }
+        return url
+    }
+}
+
+/// Errors surfaced by the in-app model downloader so silent/partial failures become visible + retriable.
+public enum ModelDownloadError: LocalizedError {
+    case emptyFileList(String)
+    case incompleteDownload(String)
+    public var errorDescription: String? {
+        switch self {
+        case .emptyFileList(let repo):
+            return "Couldn’t list files for \(repo). Check your network connection and try again."
+        case .incompleteDownload(let repo):
+            return "Download didn’t finish for \(repo) — some weight files are missing. Tap download again to resume."
         }
     }
 }

@@ -12,8 +12,10 @@ import DiffusionCore
 /// the per-component sub-source it needs for each phase (encode → transformer → vae), so each
 /// component is opened as its own source and the namespaces never collide.
 ///
-/// `tensor(_:)` is implemented for protocol conformance and routes by a `"<component>/"` key prefix
-/// (e.g. `transformer/layers.0.attention.to_q.weight`), but the normal path is `subSource(_:)`.
+/// `tensor(_:)` routes an explicit `"<component>/"` key prefix to that component, and serves any BARE
+/// key from the transformer sub-source — because the generic engine streams the denoiser blocks by
+/// calling `source.tensor("layers.0.…")` on this composite directly. `encode`/`decode` use
+/// `subSource(_:)` instead so they get a clean per-component source downstream.
 ///
 /// `isStreaming` / `freesOnRelease` are taken from the TRANSFORMER sub-source — that is the one the
 /// engine streams block-by-block, and the one whose `freesOnRelease` gates the streaming residency
@@ -44,13 +46,14 @@ public final class ZImageComponentSource: WeightSource, @unchecked Sendable {
         }
     }
 
-    private let sources: [Component: any WeightSource]
+    private let lock = NSLock()
+    private var sources: [Component: any WeightSource]
     /// The tokenizer folder, passed through so the architecture can resolve the Qwen3 tokenizer
     /// without a hub round-trip. `nil` if the model directory has no `tokenizer/` folder.
     public let tokenizerDirectory: URL?
 
-    public var isStreaming: Bool { sources[.transformer]?.isStreaming ?? false }
-    public var freesOnRelease: Bool { sources[.transformer]?.freesOnRelease ?? false }
+    public var isStreaming: Bool { lock.withLock { sources[.transformer]?.isStreaming ?? false } }
+    public var freesOnRelease: Bool { lock.withLock { sources[.transformer]?.freesOnRelease ?? false } }
 
     /// Build from explicit per-component sub-sources (used by tests and advanced callers).
     public init(sources: [Component: any WeightSource], tokenizerDirectory: URL? = nil) {
@@ -59,20 +62,34 @@ public final class ZImageComponentSource: WeightSource, @unchecked Sendable {
     }
 
     /// The sub-source for one component, or `nil` if this composite wasn't given that component.
-    public func subSource(_ component: Component) -> (any WeightSource)? { sources[component] }
+    public func subSource(_ component: Component) -> (any WeightSource)? { lock.withLock { sources[component] } }
 
-    /// Routes by a leading `"<component>/"` prefix. Present for protocol conformance; the architecture
-    /// normally uses `subSource(_:)` instead so it can hand a clean per-component source downstream.
+    /// Drop a component's sub-source after its phase is done so its eagerly-held weights free. The
+    /// text encoder's `SafetensorsWeightSource` otherwise holds ~2 GB of arrays for the whole run
+    /// (the composite is retained by the engine through decode); releasing it after `encode` reclaims
+    /// that memory before the transformer streams.
+    public func releaseComponent(_ component: Component) {
+        lock.withLock { _ = sources.removeValue(forKey: component) }
+        MLX.GPU.clearCache()
+    }
+
+    /// Resolve a tensor by key. An explicit `"<component>/"` prefix routes to that component. A BARE
+    /// key (no `"<component>/"` prefix) is served from the TRANSFORMER sub-source: the generic
+    /// `MLXDiffusionEngine` streams the denoiser blocks by calling `source.tensor("layers.0.…")` on
+    /// this composite directly (it has no notion of the component split), and the transformer is the
+    /// streamed component. `encode`/`decode` resolve their component via `subSource(_:)` and never
+    /// reach this method, so bare keys here are always transformer keys — no collision.
     public func tensor(_ key: TensorKey) throws -> MLXArray {
-        guard let slash = key.name.firstIndex(of: "/") else {
+        if let slash = key.name.firstIndex(of: "/"),
+           let component = Component(rawValue: String(key.name[..<slash])),
+           let sub = lock.withLock({ sources[component] }) {
+            let rest = String(key.name[key.name.index(after: slash)...])
+            return try sub.tensor(TensorKey(rest))
+        }
+        guard let transformer = lock.withLock({ sources[.transformer] }) else {
             throw SourceError.unknownComponent(key.name)
         }
-        let head = String(key.name[..<slash])
-        guard let component = Component(rawValue: head), let sub = sources[component] else {
-            throw SourceError.unknownComponent(key.name)
-        }
-        let rest = String(key.name[key.name.index(after: slash)...])
-        return try sub.tensor(TensorKey(rest))
+        return try transformer.tensor(key)
     }
 }
 

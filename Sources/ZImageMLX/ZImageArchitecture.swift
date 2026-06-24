@@ -86,6 +86,9 @@ public final class ZImageArchitecture: DiffusionArchitecture, @unchecked Sendabl
         let hidden = encoder.hiddenStates(tokens)   // [1, N, 2560]
         MLX.eval(hidden)                             // materialize before we drop the encoder
 
+        // Free the text-encoder source's eagerly-held arrays now; the module is dropped in
+        // releaseTextEncoder(), and only once BOTH refs are gone does the ~2 GB actually free.
+        composite.releaseComponent(.textEncoder)
         lock.lock(); self.textEncoder = encoder; self.tokenizer = tok; lock.unlock()
         return Conditioning(embeddings: hidden)
     }

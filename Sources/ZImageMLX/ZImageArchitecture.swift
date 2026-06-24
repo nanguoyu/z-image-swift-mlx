@@ -38,7 +38,8 @@ public final class ZImageArchitecture: DiffusionArchitecture, @unchecked Sendabl
         latentChannels: 16,
         defaultSampler: .flowMatchEuler,
         defaultSteps: 8,
-        defaultGuidance: 1.0)
+        defaultGuidance: 1.0,
+        samplerShift: ZImageConfig.Scheduler.shift)
 
     public enum ArchitectureError: Error, CustomStringConvertible {
         case notComponentSource

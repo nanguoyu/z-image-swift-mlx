@@ -99,7 +99,8 @@ public final class ZImageArchitecture: DiffusionArchitecture, @unchecked Sendabl
         return Conditioning(embeddings: hidden)
     }
 
-    public func releaseTextEncoder() {
+    public func releaseTextEncoder() async {
+        // Z-Image's encoder is the module itself (not a @MainActor singleton), so niling it frees it.
         lock.lock(); textEncoder = nil; tokenizer = nil; lock.unlock()
         MLX.GPU.clearCache()
     }

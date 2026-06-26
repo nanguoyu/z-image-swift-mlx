@@ -49,7 +49,8 @@ public actor ZImageFacadeEngine: DiffusionEngine {
         guard request.size.width == request.size.height else { throw ZImageEngineError.nonSquareUnsupported }
         progress(.preparing)
         let image = try pipeline.generate(
-            prompt: request.prompt, size: request.size.width, steps: request.steps, seed: request.seed
+            prompt: request.prompt, size: request.size.width, steps: request.steps, seed: request.seed,
+            control: request.control
         ) { step, total in
             progress(.denoising(step: step, total: total, preview: nil))
         }

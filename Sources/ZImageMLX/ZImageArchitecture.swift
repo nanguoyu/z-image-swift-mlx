@@ -104,6 +104,15 @@ public final class ZImageArchitecture: DiffusionArchitecture, @unchecked Sendabl
         MLX.GPU.clearCache()
     }
 
+    public func releaseCachedResources() {
+        lock.lock()
+        textEncoder = nil
+        tokenizer = nil
+        vae = nil
+        lock.unlock()
+        MLX.GPU.clearCache()
+    }
+
     public func makeDenoiser(source: WeightSource) throws -> any Denoiser {
         // Streaming S3-DiT: the 30 main `layers.*` blocks are NOT resident; each ZImageStreamableBlock
         // loads/frees its own block per step from the transformer source (the engine drives

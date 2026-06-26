@@ -66,27 +66,36 @@ public final class ZImagePipeline: @unchecked Sendable {
 
     /// Text-to-image. `size` is the square side in pixels (multiple of 16; 1024 is native).
     public func generate(prompt: String, size: Int = 1024, steps: Int = ZImageConfig.Scheduler.defaultSteps,
-                         seed: UInt64 = 0, progress: (@Sendable (Int, Int) -> Void)? = nil) throws -> CGImage {
+                         seed: UInt64 = 0, control: GenerationControl? = nil,
+                         progress: (@Sendable (Int, Int) -> Void)? = nil) throws -> CGImage {
         guard let denoiser, let vae else { throw PipelineError.notLoaded }
         // VAE downsamples by 8 and the DiT patchifies by 2, so the latent side must be even:
         // require size to be a multiple of 16 (fail at the call site, not deep in the transformer).
         let factor = ZImageConfig.VAE.downsampleFactor
         guard size % (factor * ZImageConfig.DiT.patchSize) == 0 else { throw PipelineError.invalidSize(size) }
+        try control?.checkpoint()
         let conditioning = try encode(prompt)
+        try control?.checkpoint()
         let sampler = FlowMatchEulerSampler(shift: ZImageConfig.Scheduler.shift,
                                             shiftTerminal: ZImageConfig.Scheduler.shiftTerminal)
         let sigmas = sampler.timesteps(steps: steps)
         let channels = ZImageConfig.VAE.latentChannels
         var latent = MLXRandom.normal([1, channels, size / factor, size / factor], key: MLXRandom.key(seed)).asType(.bfloat16)
         for i in 0..<steps {
+            try control?.checkpoint()
             let t = sigmas[i], tNext = sigmas[i + 1]
             let timestep = MLXArray(t)
             var hidden = denoiser.embed(latent: latent, timestep: timestep, conditioning: conditioning)
-            for block in denoiser.blocks { hidden = block(hidden, conditioning: conditioning, timestep: timestep) }
+            for block in denoiser.blocks {
+                try control?.checkpoint()
+                hidden = block(hidden, conditioning: conditioning, timestep: timestep)
+            }
             latent = sampler.step(latent: latent, modelOutput: denoiser.unembed(hidden), t: t, tPrev: tNext)
             eval(latent)
             progress?(i + 1, steps)
+            try control?.checkpoint()
         }
+        try control?.checkpoint()
         let imageNHWC = vae.decode(latent).asType(.float32)
         eval(imageNHWC)
         guard let image = ImageConversion.cgImage(fromHWC: imageNHWC[0], range: .signed) else {

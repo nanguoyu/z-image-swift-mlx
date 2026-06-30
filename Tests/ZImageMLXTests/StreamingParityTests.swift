@@ -90,12 +90,12 @@ final class StreamingParityTests: XCTestCase {
         let encStreaming = try ZImageComponentSource.open(modelDirectory: modelDir, streaming: true)
         let conditioning = try await arch.encode(prompt, negative: nil, source: encStreaming)
         MLX.eval(conditioning.embeddings)
-        arch.releaseTextEncoder()
+        await arch.releaseTextEncoder()
         MLX.GPU.clearCache()
 
         // --- 2. RESIDENT path: whole-tree load of the transformer (the verified ZImagePipeline load). ---
         let resident = ZImageDenoiser(streaming: false)
-        ZImageWeights.load(try ZImageWeights.tensors(in: transformerDir), into: resident)
+        try ZImageWeights.load(try ZImageWeights.tensors(in: transformerDir), into: resident)
         MLX.eval(resident)
         let residentLatent = try denoiseLatent(denoiser: resident, streaming: false, txSource: nil,
                                                conditioning: conditioning, size: size, steps: steps, seed: seed)

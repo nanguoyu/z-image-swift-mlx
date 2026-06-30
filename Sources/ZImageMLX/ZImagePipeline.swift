@@ -40,7 +40,7 @@ public final class ZImagePipeline: @unchecked Sendable {
     public func loadModels(progress: (@Sendable (Double) -> Void)? = nil) async throws {
         func load(_ component: String, _ module: Module) throws {
             let dir = modelDirectory.appendingPathComponent(component)
-            ZImageWeights.load(try ZImageWeights.tensors(in: dir), into: module)
+            try ZImageWeights.load(try ZImageWeights.tensors(in: dir), into: module)
         }
         let enc = Qwen3TextEncoder(); try load("text_encoder", enc); progress?(0.4)
         let dn = ZImageDenoiser(); try load("transformer", dn); progress?(0.85)

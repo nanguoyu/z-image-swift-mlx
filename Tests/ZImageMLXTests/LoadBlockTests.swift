@@ -63,7 +63,7 @@ final class LoadBlockTests: XCTestCase {
             stripped[String(k.dropFirst(prefix.count))] = v
         }
         let residentBlock = ZImageTransformerBlock(hasAdaLN: true)
-        ZImageWeights.load(stripped, into: residentBlock, groupSize: 64, bits: 4)
+        try ZImageWeights.load(stripped, into: residentBlock, groupSize: 64, bits: 4)
         MLX.eval(residentBlock)
 
         // 4. STREAMING path: per-prefix loader straight from a WeightSource.
@@ -101,6 +101,48 @@ final class LoadBlockTests: XCTestCase {
         let source = FakeEmptySource()
         let block = ZImageTransformerBlock(hasAdaLN: true)
         XCTAssertThrowsError(try ZImageWeights.loadBlock(prefix: "layers.0.", from: source, into: block))
+    }
+
+    /// The whole-tree `load` must also assert coverage: a checkpoint missing ONE model parameter
+    /// would leave that param at random init (silent garbage). Build a complete quantized checkpoint
+    /// for one block, drop a single key, and assert `load` throws `uncoveredParameters` naming it
+    /// — proving the guard fires (and that a COMPLETE checkpoint still loads without throwing).
+    func testWholeTreeLoadThrowsOnUncoveredParameter() throws {
+        // 1. A reference block, quantized exactly like the on-disk checkpoint (Linear -> 4-bit).
+        MLXRandom.seed(7)
+        let reference = ZImageTransformerBlock(hasAdaLN: true)
+        var randomized: [String: MLXArray] = [:]
+        for (path, p) in reference.parameters().flattened() {
+            randomized[path] = MLXRandom.normal(p.shape).asType(p.dtype)
+        }
+        reference.update(parameters: ModuleParameters.unflattened(randomized))
+        quantize(model: reference, groupSize: 64, bits: 4) { _, layer in layer is Linear }
+
+        // 2. Flatten the quantized reference's full (post-quantize) parameter set — this is the
+        //    complete checkpoint for the block.
+        var complete: [String: MLXArray] = [:]
+        for (path, p) in reference.parameters().flattened() { complete[path] = p }
+
+        // 3a. The COMPLETE checkpoint loads cleanly (no false positive on a legitimate load).
+        let okBlock = ZImageTransformerBlock(hasAdaLN: true)
+        XCTAssertNoThrow(try ZImageWeights.load(complete, into: okBlock, groupSize: 64, bits: 4))
+
+        // 3b. Drop ONE key → load must throw, naming the uncovered parameter.
+        let droppedKey = "attention.to_q.weight"
+        XCTAssertNotNil(complete[droppedKey], "test precondition: \(droppedKey) should exist")
+        var missingOne = complete
+        missingOne.removeValue(forKey: droppedKey)
+
+        let brokenBlock = ZImageTransformerBlock(hasAdaLN: true)
+        XCTAssertThrowsError(
+            try ZImageWeights.load(missingOne, into: brokenBlock, groupSize: 64, bits: 4)
+        ) { error in
+            guard case let WeightLoadError.uncoveredParameters(keys) = error else {
+                return XCTFail("expected .uncoveredParameters, got \(error)")
+            }
+            XCTAssertTrue(keys.contains(droppedKey),
+                          "uncovered list should name the dropped key \(droppedKey); got \(keys)")
+        }
     }
 
     /// `WeightSource` that has no tensors at all — every `tensor(_:)` throws.

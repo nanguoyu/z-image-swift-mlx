@@ -53,8 +53,16 @@ public enum ZImageWeights {
     /// then load all weights. Conv weights are transposed OIHW→OHWI; tensors with no matching
     /// module parameter (recomputable buffers like `rotary_emb.inv_freq`, converter-only extras)
     /// are dropped so the load is exact.
+    ///
+    /// Coverage is asserted: every destination module parameter must be covered by a checkpoint
+    /// tensor. A model param with no matching tensor would silently keep its random init (garbage
+    /// output with no error) — so an uncovered param throws `WeightLoadError.uncoveredParameters`
+    /// rather than loading a partial tree. No Z-Image param is intentionally absent from the
+    /// checkpoint (RoPE tables are recomputed, not parameters; the learned `*_pad_token` params and
+    /// every quantized `.scales`/`.biases` destination ARE on disk), so this never fires on a
+    /// legitimate load.
     public static func load(_ weights: [String: MLXArray], into module: Module,
-                            groupSize: Int = 64, bits: Int = 4) {
+                            groupSize: Int = 64, bits: Int = 4) throws {
         let canon = canonicalize(weights)
         // Quantize first so the Quantized{Linear,Embedding} `.scales`/`.biases` params exist as
         // destinations. Both Linear AND Embedding are 4-bit in the checkpoint (embed_tokens too).
@@ -64,6 +72,12 @@ public enum ZImageWeights {
         // Conv weights in this checkpoint are already MLX-native OHWI — no OIHW->OHWI transpose.
         let valid = Set(module.parameters().flattened().map { $0.0 })
         let filtered = canon.filter { valid.contains($0.key) }
+        // Coverage check: every model parameter must have received a checkpoint value. Missing keys
+        // here mean random init survives into inference — surface them instead of loading garbage.
+        let uncovered = valid.subtracting(filtered.keys)
+        guard uncovered.isEmpty else {
+            throw WeightLoadError.uncoveredParameters(uncovered.sorted())
+        }
         module.update(parameters: ModuleParameters.unflattened(filtered))
     }
 
@@ -155,9 +169,16 @@ public enum ZImageWeights {
 public enum WeightLoadError: Error, CustomStringConvertible {
     /// A destination module parameter had no corresponding tensor in the `WeightSource`.
     case missingTensor(String)
+    /// The whole-tree `load` left one or more model parameters uncovered by the checkpoint (they
+    /// would have silently retained random init). Carries the sorted list of uncovered param paths.
+    case uncoveredParameters([String])
     public var description: String {
         switch self {
         case .missingTensor(let key): return "WeightSource is missing tensor for key '\(key)'"
+        case .uncoveredParameters(let keys):
+            let shown = keys.prefix(10).joined(separator: ", ")
+            let more = keys.count > 10 ? " (+\(keys.count - 10) more)" : ""
+            return "Checkpoint is missing weights for \(keys.count) model parameter(s): \(shown)\(more)"
         }
     }
 }

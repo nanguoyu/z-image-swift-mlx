@@ -177,35 +177,17 @@ public struct ModelDownloader: Sendable {
             throw ModelDownloadError.invalidURL(urlString)
         }
         var request = URLRequest(url: url)
-        let partURL = destination.appendingPathExtension("part")
-        var existingBytes = Self.fileSize(partURL)
-        if existingBytes > 0 { request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range") }
-        // Native chunked download to a temp file (URLSession.bytes' per-UInt8 AsyncSequence is far too
-        // slow for multi-GB shards). Resume is handled via the Range header + the .part file.
-        let (tempURL, response) = try await session.download(for: request)
-        defer { try? FileManager.default.removeItem(at: tempURL) }
-        guard let http = response as? HTTPURLResponse else { throw ModelDownloadError.incompleteDownload(repoId) }
-        if existingBytes > 0, http.statusCode != 206 {
-            // Server ignored the Range and sent the full file — discard the partial to avoid corruption.
-            try? FileManager.default.removeItem(at: partURL)
-            existingBytes = 0
-        }
-        guard http.statusCode == 200 || http.statusCode == 206 else { throw ModelDownloadError.incompleteDownload(repoId) }
-        try Task.checkCancellation()
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if existingBytes == 0 {
-            if FileManager.default.fileExists(atPath: partURL.path) { try FileManager.default.removeItem(at: partURL) }
-            try FileManager.default.moveItem(at: tempURL, to: partURL)
-        } else {
-            let outHandle = try FileHandle(forWritingTo: partURL)
-            let inHandle = try FileHandle(forReadingFrom: tempURL)
-            defer { try? outHandle.close(); try? inHandle.close() }
-            try outHandle.seekToEnd()
-            while let chunk = try inHandle.read(upToCount: 8 * 1024 * 1024), !chunk.isEmpty {
-                try outHandle.write(contentsOf: chunk)
-            }
-        }
-        progress(Self.fileSize(partURL))
+        let partURL = destination.appendingPathExtension("part")
+        let existingBytes = Self.fileSize(partURL)
+        if existingBytes > 0 { request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range") }
+        // STREAMING download straight into `.part` via a per-task delegate. We deliberately avoid
+        // session.download(for:), which downloads the WHOLE body atomically to a system temp file —
+        // cancelling mid-file there discards every in-progress byte, so a 4.6 GB shard restarts at 0.
+        // Writing each chunk to `.part` as it arrives means a cancel leaves a valid partial that the
+        // Range header resumes next time. Resume is handled via the Range header + 200/206 branching.
+        try await Self.streamDownload(request: request, into: partURL, existingBytes: existingBytes,
+                                      repoId: repoId, filePath: file.path, session: session, progress: progress)
         guard Self.fileMatches(partURL, expectedSize: file.size, expectedSHA256: file.sha256) else {
             // Remove the corrupt partial so a retry re-downloads from scratch, not the same bad prefix.
             try? FileManager.default.removeItem(at: partURL)
@@ -213,6 +195,162 @@ public struct ModelDownloader: Sendable {
         }
         if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
         try FileManager.default.moveItem(at: partURL, to: destination)
+    }
+
+    /// Stream a download into `partURL` chunk-by-chunk so a cancellation leaves a valid resumable
+    /// partial. Uses a `URLSessionDataTask` with a PER-TASK delegate (iOS 15+/macOS 12+) so the shared
+    /// `session` is untouched. `existingBytes` is the size of any pre-existing `.part` we may resume.
+    private static func streamDownload(request: URLRequest, into partURL: URL, existingBytes: Int64,
+                                       repoId: String, filePath: String, session: URLSession,
+                                       progress: @escaping @Sendable (Int64) -> Void) async throws {
+        try Task.checkCancellation()
+        let delegate = StreamingDownloadDelegate(partURL: partURL, existingBytes: existingBytes,
+                                                 repoId: repoId, progress: progress)
+        let task = session.dataTask(with: request)
+        task.delegate = delegate
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                delegate.continuation = continuation
+                task.resume()
+            }
+        } onCancel: {
+            // Ends the stream; the FileHandle's already-written bytes stay in `.part` for next time.
+            task.cancel()
+        }
+    }
+
+    /// Per-task delegate that writes the response body into `.part` as it streams in. The FileHandle
+    /// write + cumulative counter run on the URLSession's (serial) delegate queue; the continuation
+    /// and handle are each touched exactly once, guarded by `lock`.
+    private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        private let partURL: URL
+        private let existingBytes: Int64
+        private let repoId: String
+        private let progress: @Sendable (Int64) -> Void
+
+        private let lock = NSLock()
+        private var handle: FileHandle?
+        private var writtenTotal: Int64       // cumulative bytes currently in `.part`
+        private var finished = false          // guards continuation + handle-close (exactly once)
+        private var setupError: Error?        // error raised in didReceive response
+
+        // Progress throttling: emit at most ~once per 250 ms or per 8 MB.
+        private var lastProgressTime = DispatchTime.now()
+        private var bytesSinceProgress: Int64 = 0
+
+        var continuation: CheckedContinuation<Void, Error>?
+
+        init(partURL: URL, existingBytes: Int64, repoId: String,
+             progress: @escaping @Sendable (Int64) -> Void) {
+            self.partURL = partURL
+            self.existingBytes = existingBytes
+            self.repoId = repoId
+            self.progress = progress
+            self.writtenTotal = existingBytes
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            guard let http = response as? HTTPURLResponse else {
+                fail(with: ModelDownloadError.incompleteDownload(repoId))
+                completionHandler(.cancel)
+                return
+            }
+
+            var startBytes = existingBytes
+            if existingBytes > 0 && http.statusCode != 206 {
+                // Server ignored Range and returned the whole file (200) — discard the partial so we
+                // never append a full body onto a partial one (corruption). Start fresh.
+                try? FileManager.default.removeItem(at: partURL)
+                startBytes = 0
+            }
+
+            guard http.statusCode == 200 || http.statusCode == 206 else {
+                fail(with: ModelDownloadError.incompleteDownload(repoId))
+                completionHandler(.cancel)
+                return
+            }
+
+            do {
+                if startBytes == 0 {
+                    // Fresh (or Range-reset) download: (re)create an empty `.part`.
+                    if FileManager.default.fileExists(atPath: partURL.path) {
+                        try FileManager.default.removeItem(at: partURL)
+                    }
+                    FileManager.default.createFile(atPath: partURL.path, contents: nil)
+                    let h = try FileHandle(forWritingTo: partURL)
+                    lock.lock(); handle = h; writtenTotal = 0; lock.unlock()
+                } else {
+                    // Resume (206): append to the existing `.part`.
+                    let h = try FileHandle(forWritingTo: partURL)
+                    try h.seekToEnd()
+                    lock.lock(); handle = h; writtenTotal = startBytes; lock.unlock()
+                }
+            } catch {
+                fail(with: error)
+                completionHandler(.cancel)
+                return
+            }
+
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            lock.lock()
+            guard let h = handle, !finished else { lock.unlock(); return }
+            do {
+                try h.write(contentsOf: data)
+                writtenTotal += Int64(data.count)
+                bytesSinceProgress += Int64(data.count)
+                let now = DispatchTime.now()
+                let elapsedMs = (now.uptimeNanoseconds - lastProgressTime.uptimeNanoseconds) / 1_000_000
+                let total = writtenTotal
+                let shouldReport = elapsedMs >= 250 || bytesSinceProgress >= 8 * 1024 * 1024
+                if shouldReport {
+                    lastProgressTime = now
+                    bytesSinceProgress = 0
+                }
+                lock.unlock()
+                if shouldReport { progress(total) }
+            } catch {
+                lock.unlock()
+                fail(with: error)
+                dataTask.cancel()
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            lock.lock()
+            if finished { lock.unlock(); return }
+            finished = true
+            try? handle?.close()      // flush before we let the caller verify
+            handle = nil
+            let pending = continuation
+            continuation = nil
+            let setup = setupError
+            let total = writtenTotal
+            lock.unlock()
+
+            // Emit a final progress so the throttled value reflects the true `.part` size.
+            progress(total)
+
+            if let setup = setup {
+                pending?.resume(throwing: setup)
+            } else if let error = error {
+                pending?.resume(throwing: error)
+            } else {
+                pending?.resume(returning: ())
+            }
+        }
+
+        /// Record a setup/write failure; the actual continuation resume happens in didCompleteWithError
+        /// (cancelling the task drives us there), so close + resume stay exactly-once.
+        private func fail(with error: Error) {
+            lock.lock()
+            if setupError == nil { setupError = error }
+            lock.unlock()
+        }
     }
 
     private static func writeManifest(_ files: [HubFile], at directory: URL) throws {

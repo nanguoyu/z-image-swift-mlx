@@ -70,6 +70,46 @@ final class DownloaderFileTests: XCTestCase {
         XCTAssertTrue(downloader.isDownloaded(repoId: repo, files: ["vae/model_vae.safetensors"]))
     }
 
+    // MARK: - Against Hugging Face (opt-in: MOBILEDIFFUSER_NETWORK_TESTS=1)
+
+    /// One small LFS file from a subfolder of a GGUF repository: fetched alone, SHA-256 verified on
+    /// the way in, recorded, reported installed, then removed.
+    func testDownloadsOneFileOfARepository() async throws {
+        try Self.requireNetworkTests()
+        let downloader = ModelDownloader(downloadBase: base)
+        let repo = "unsloth/Qwen-Image-2.1-GGUF", path = "assets/spaces.png"
+
+        let urls = try await downloader.download(repoId: repo, files: [path]) { _ in }
+
+        XCTAssertEqual(urls, [downloader.localURL(repoId: repo).appendingPathComponent(path)])
+        let png = try Data(contentsOf: urls[0])
+        XCTAssertEqual(Array(png.prefix(4)), [0x89, 0x50, 0x4E, 0x47])
+        XCTAssertTrue(downloader.isDownloaded(repoId: repo, files: [path]))
+        let others = try FileManager.default.contentsOfDirectory(atPath: downloader.localURL(repoId: repo).path)
+        XCTAssertFalse(others.contains { $0.hasSuffix(".gguf") }, "nothing but the named file is fetched")
+
+        try downloader.delete(repoId: repo, files: [path])
+        XCTAssertFalse(downloader.isDownloaded(repoId: repo, files: [path]))
+    }
+
+    func testAFileTheRepositoryDoesNotPublishIsReported() async throws {
+        try Self.requireNetworkTests()
+        let downloader = ModelDownloader(downloadBase: base)
+        do {
+            _ = try await downloader.download(repoId: "unsloth/Qwen-Image-2.1-GGUF",
+                                              files: ["qwen-image-2.1-Q1_NOPE.gguf"]) { _ in }
+            XCTFail("an unpublished file must not download")
+        } catch ModelDownloadError.fileNotFound(_, let path) {
+            XCTAssertEqual(path, "qwen-image-2.1-Q1_NOPE.gguf")
+        }
+    }
+
+    private static func requireNetworkTests() throws {
+        guard ProcessInfo.processInfo.environment["MOBILEDIFFUSER_NETWORK_TESTS"] == "1" else {
+            throw XCTSkip("set MOBILEDIFFUSER_NETWORK_TESTS=1 to run tests against Hugging Face")
+        }
+    }
+
     // MARK: - Helpers
 
     private func place(_ path: String, bytes: Int) throws {

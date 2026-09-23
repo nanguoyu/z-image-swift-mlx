@@ -135,6 +135,72 @@ public struct ModelDownloader: Sendable {
         return url
     }
 
+    /// Download (idempotent, resumable) exactly these files of `repoId`, returning where they landed.
+    /// For repositories that publish many alternatives side by side, such as one GGUF file per
+    /// quantization, where fetching the whole repository would download every variant.
+    @discardableResult
+    public func download(repoId: String, files paths: [String],
+                         progress: @escaping @Sendable (Double) -> Void) async throws -> [URL] {
+        #if os(iOS)
+        URLCache.shared.removeAllCachedResponses()
+        #endif
+        let root = localURL(repoId: repoId)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let listed = try await fetchHubFiles(repoId: repoId)
+        let wanted = try paths.map { path -> HubFile in
+            guard let file = listed.first(where: { $0.path == path }) else {
+                throw ModelDownloadError.fileNotFound(repoId, path)
+            }
+            return file
+        }
+        let totalBytes = max(1, wanted.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
+        var completedBytes: Int64 = 0
+        let session = Self.makeSession()
+        for file in wanted {
+            let destination = root.appendingPathComponent(file.path)
+            let baseBytes = completedBytes
+            try await downloadFile(repoId: repoId, file: file, to: destination, session: session) { bytes in
+                progress(min(1, Double(baseBytes + bytes) / Double(totalBytes)))
+            }
+            completedBytes += file.size ?? Self.fileSize(destination)
+            // Recorded per file, so a later check can tell a finished file from a stray one.
+            try Self.recordInManifest([file], at: root)
+        }
+        progress(1)
+        return wanted.map { root.appendingPathComponent($0.path) }
+    }
+
+    /// Whether these files of `repoId` are completely on disk: present, not being re-downloaded, and
+    /// the size recorded when they were downloaded. Cheap: no hashing, no network.
+    public func isDownloaded(repoId: String, files paths: [String]) -> Bool {
+        let fm = FileManager.default
+        let root = localURL(repoId: repoId)
+        let recorded = Self.readManifest(at: root)?.files ?? []
+        for path in paths {
+            let url = root.appendingPathComponent(path)
+            guard fm.fileExists(atPath: url.path),
+                  !fm.fileExists(atPath: url.appendingPathExtension("part").path),
+                  let entry = recorded.first(where: { $0.path == path }) else { return false }
+            if let size = entry.size, Self.fileSize(url) != size { return false }
+        }
+        return true
+    }
+
+    /// Remove these files of `repoId` (and any partial download of them), and forget them.
+    public func delete(repoId: String, files paths: [String]) throws {
+        let fm = FileManager.default
+        let root = localURL(repoId: repoId)
+        for path in paths {
+            let url = root.appendingPathComponent(path)
+            for candidate in [url, url.appendingPathExtension("part")] where fm.fileExists(atPath: candidate.path) {
+                try fm.removeItem(at: candidate)
+            }
+        }
+        guard var manifest = Self.readManifest(at: root) else { return }
+        manifest.files.removeAll { paths.contains($0.path) }
+        try Self.writeManifest(manifest, at: root)
+    }
+
     private static func isModelFile(_ file: HubFile) -> Bool {
         file.path.hasSuffix(".safetensors") || file.path.hasSuffix(".json") || file.path == "tokenizer.model"
     }
@@ -354,10 +420,30 @@ public struct ModelDownloader: Sendable {
     }
 
     private static func writeManifest(_ files: [HubFile], at directory: URL) throws {
-        let manifest = DownloadManifest(files: files.map { DownloadManifest.File(path: $0.path, size: $0.size, sha256: $0.sha256) })
+        try writeManifest(DownloadManifest(files: files.map { DownloadManifest.File(path: $0.path, size: $0.size, sha256: $0.sha256) }),
+                          at: directory)
+    }
+
+    private static func writeManifest(_ manifest: DownloadManifest, at directory: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(manifest).write(to: directory.appendingPathComponent(manifestFilename), options: .atomic)
+    }
+
+    private static func readManifest(at directory: URL) -> DownloadManifest? {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent(manifestFilename)) else { return nil }
+        return try? JSONDecoder().decode(DownloadManifest.self, from: data)
+    }
+
+    /// Add or replace these files' entries, keeping the entries of files downloaded earlier.
+    private static func recordInManifest(_ files: [HubFile], at directory: URL) throws {
+        var manifest = readManifest(at: directory) ?? DownloadManifest(files: [])
+        for file in files {
+            manifest.files.removeAll { $0.path == file.path }
+            manifest.files.append(DownloadManifest.File(path: file.path, size: file.size, sha256: file.sha256))
+        }
+        manifest.files.sort { $0.path < $1.path }
+        try writeManifest(manifest, at: directory)
     }
 
     private static func verifyManifestIfPresent(at directory: URL, verifyHashes: Bool = false) -> Bool {
@@ -408,6 +494,7 @@ public enum ModelDownloadError: LocalizedError {
     case incompleteDownload(String)
     case invalidURL(String)
     case hashMismatch(String)
+    case fileNotFound(String, String)
     public var errorDescription: String? {
         switch self {
         case .emptyFileList(let repo):
@@ -418,6 +505,8 @@ public enum ModelDownloadError: LocalizedError {
             return "Invalid download URL: \(url)"
         case .hashMismatch(let file):
             return "Hash verification failed for \(file). Tap download again to retry."
+        case .fileNotFound(let repo, let file):
+            return "\(file) is no longer published in \(repo)."
         }
     }
 }
